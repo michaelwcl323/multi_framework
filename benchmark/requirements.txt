@@ -1,3 +1,4 @@
 boto3==1.16.0
 fabric==3.0.0
 matplotlib==3.3.4
+asyncssh>=2.13.0,<3.0.0

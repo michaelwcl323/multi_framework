@@ -1,4 +1,3 @@
-use std::convert::TryInto as _;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration, Instant};
@@ -21,6 +20,40 @@ pub struct BatchMaker {
     tx_txns: Sender<Vec<Transaction>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::channel;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn full_batches_reset_size_before_accepting_more_transactions() {
+        let (sender, receiver) = channel(10);
+        let (batches, mut output) = channel(10);
+        BatchMaker::spawn(1000, 1000, receiver, batches);
+        for _ in 0..2 {
+            sender.send(vec![0; 500]).await.unwrap();
+        }
+        assert_eq!(output.recv().await.unwrap().len(), 2);
+        sender.send(vec![0; 500]).await.unwrap();
+        assert!(timeout(Duration::from_millis(20), output.recv()).await.is_err());
+        sender.send(vec![0; 500]).await.unwrap();
+        assert_eq!(output.recv().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn partial_batches_seal_on_timeout_and_start_a_fresh_size_budget() {
+        let (sender, receiver) = channel(10);
+        let (batches, mut output) = channel(10);
+        BatchMaker::spawn(1000, 100, receiver, batches);
+        sender.send(vec![0; 500]).await.unwrap();
+        assert_eq!(timeout(Duration::from_secs(1), output.recv()).await.unwrap().unwrap().len(), 1);
+        sender.send(vec![0; 500]).await.unwrap();
+        assert!(timeout(Duration::from_millis(20), output.recv()).await.is_err());
+        assert_eq!(timeout(Duration::from_secs(1), output.recv()).await.unwrap().unwrap().len(), 1);
+    }
+}
+
 impl BatchMaker {
     pub fn spawn(
         batch_size: usize,
@@ -33,7 +66,7 @@ impl BatchMaker {
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
-                current_batch: Batch::with_capacity(batch_size * 2),
+                current_batch: Batch::new(),
                 current_batch_size: 0,
                 tx_txns,
             }
@@ -76,6 +109,7 @@ impl BatchMaker {
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
         let batch: Vec<Transaction> = self.current_batch.drain(..).collect();
+        self.current_batch_size = 0;
 
         self.tx_txns
             .send(batch)

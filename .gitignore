@@ -7,3 +7,10 @@ benchmark/.parameters.json
 .node-*?.json
 .idea
 Cargo.lock
+benchmark/cloudlab_settings.json
+benchmark/.venv/
+benchmark/node
+benchmark/benchmark_client
+benchmark/logs/
+benchmark/results/
+__pycache__/

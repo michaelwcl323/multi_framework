@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         .context("The size of transactions must be a non-negative integer")?;
     let burst_duration = matches
         .value_of("burst")
-        .unwrap()
+        .unwrap_or("50")
         .parse::<u64>()
         .context("Burst duration must be a non-negative integer")?;
     let rate = matches
@@ -64,7 +64,9 @@ async fn main() -> Result<()> {
     info!("Transactions size: {} B", size);
 
     // NOTE: This log entry is used to compute performance.
-    info!("Transactions rate: {} tx/s", rate * (1000 / burst_duration));
+    anyhow::ensure!(burst_duration > 0, "Burst duration must be positive");
+    anyhow::ensure!(rate >= 20, "Rate argument must allow at least one transaction per burst");
+    info!("Transactions rate: {} tx/s", (rate / 20) * 1000 / burst_duration);
 
     let client = Client {
         target,

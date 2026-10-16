@@ -134,7 +134,7 @@ class Committee:
             authority_addresses = []
             for id, worker in authority['workers'].items():
                 authority_addresses += [(id, worker['transactions'])]
-                addresses.append(authority_addresses)
+            addresses.append(authority_addresses)
         return addresses
     
     def batch_proposer_workers_addresses(self, faults=0):
@@ -279,6 +279,10 @@ class BenchParameters:
             self.duration = int(json['duration'])
 
             self.runs = int(json['runs']) if 'runs' in json else 1
+            burst = json.get('burst', 50)
+            self.burst = [int(x) for x in (burst if isinstance(burst, list) else [burst])]
+            if not self.burst or min(self.burst) <= 0:
+                raise ConfigError('Burst values must be positive')
 
         except KeyError as e:
             raise ConfigError(f'Malformed bench parameters: missing key {e}')

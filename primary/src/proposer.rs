@@ -5,9 +5,7 @@ use crate::messages::{
 use crate::primary::Round;
 use config::Committee;
 use crypto::{PublicKey, SignatureService};
-#[cfg(feature = "benchmark")]
-use log::info;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -165,21 +163,20 @@ impl Proposer {
 
         let parents: Vec<Certificate> = self.last_parents.drain(..).collect();
 
+        let proposal_id = (self.committee.id() << 20) as u64 + self.round;
+        // Log the same identifier used by payload and commit events, before construction.
+        info!("Created {}", proposal_id);
         let header = Header::new(
             self.name,
             self.committee.id(),
             self.round,
             payload,
-            (self.committee.id() << 20) as u64 + self.round,
+            proposal_id,
             parents.iter().map(|x| x.header_id).collect(),
         )
         .await;
 
         self.last_proposal_time = Instant::now();
-        info!(
-            "Created {:?}",
-            (self.committee.id() << 20) as u64 + self.round + 1
-        );
 
         #[cfg(feature = "benchmark")]
         {
@@ -201,7 +198,7 @@ impl Proposer {
                 for id in tx_ids {
                     info!(
                         "Header {:?} contains sample tx {}",
-                        header.id,
+                        header.sample_txn,
                         u64::from_be_bytes(id)
                     );
                 }

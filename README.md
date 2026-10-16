@@ -57,6 +57,9 @@ The first execution may take longer, as it compiles the Rust code in `release` m
 
 ## Remote Run
 
+For a static CloudLab testbed, see [CloudLab setup and benchmarks](benchmark/CLOUDLAB.md).
+The `cloudlab-*` Fabric tasks use SSH inventory and work independently of GCP.
+
 The scripts are configured to deploy on GCP instances. Ensure that your GCP API credentials are placed in `benchmark/benchmark/key.json`. You can then install the required dependencies on the remote servers by running `fab install`.
 
 We use the Linux tc command to introduce network delays and enforce bandwidth limits. To configure these settings, run `fab set-filter`. By default, the network delay (100 ms) and bandwidth (100 Mbit/s) are hardcoded in remote.py; you can modify these values in that file as needed.
