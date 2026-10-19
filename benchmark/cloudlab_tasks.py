@@ -46,38 +46,39 @@ def cloudlab_install(ctx, settings='cloudlab_settings.json', max_workers=8):
 @task
 def cloudlab_remote(
     ctx, rates='40000,80000,120000,160000,200000', nodes=10,
-    runs=2, duration=120, burst=50, debug=False, consensus_only=False,
+    runs=1, duration=120, burst=50, debug=False, consensus_only=False,
     update=True, settings='cloudlab_settings.json', output_dir='results/Sailfish',
-    batch_size=2_048_000, header_size=2_048_000,
-    max_batch_delay=200, max_header_delay=200, tx_size=500,
+    batch_size=500_000, header_size=500_000,
+    max_batch_delay=200, max_header_delay=3_000, tx_size=512, client_rate=450,
 ):
     """Run Sailfish on CloudLab; sizes are bytes and delays are milliseconds."""
     # EDIT EXPERIMENT PARAMETERS HERE (also exposed as Fabric CLI options).
-    # 2,048,000 B / 500 B = 4096 transactions per full batch/header.
+    # aa70da4::remote parameters with 500000-byte headers and CloudLab load.
     from environment_setup import EnvironmentSetupError, setup_local_environment
     try:
         rate_list = [int(x) for x in str(rates).replace(' ', ',').split(',') if x]
         nodes, runs, duration, burst = map(int, (nodes, runs, duration, burst))
+        client_rate = int(client_rate)
         batch_size, header_size, tx_size = map(int, (batch_size, header_size, tx_size))
         max_batch_delay, max_header_delay = map(int, (max_batch_delay, max_header_delay))
         if nodes <= 1 or min(runs, duration, burst, max_batch_delay, max_header_delay) <= 0:
             raise ValueError('Nodes must exceed one; runs, durations and delays must be positive')
-        if not rate_list or min(rate_list) <= 0 or tx_size < 9:
+        if not rate_list or min(rate_list) <= 0 or tx_size < 9 or client_rate <= 0:
             raise ValueError('Input rates must be positive; transaction size must be at least 9 B')
         if batch_size < tx_size or header_size < tx_size:
             raise ValueError('Batch/header size must hold at least one transaction')
-        if batch_size % tx_size or header_size % tx_size:
-            raise ValueError('Batch/header sizes must be multiples of transaction size')
         setup_local_environment(check_only=True)
         bench = dict(faults=0, nodes=[nodes], workers=1, collocate=True,
                      rate=rate_list, tx_size=tx_size, duration=duration, runs=runs, burst=[burst])
-        params = dict(consensus_only=bool(consensus_only), tx_size=tx_size,
+        params = dict(nodes=nodes, bandwidth=12_500_000, prime_prop_time=3_000,
+                      use_vote_aggregator=False,
+                      consensus_only=bool(consensus_only), tx_size=tx_size,
                       header_size=header_size, max_header_delay=max_header_delay,
                       batch_size=batch_size, max_batch_delay=max_batch_delay,
-                      gc_depth=50, sync_retry_delay=10_000,
-                      sync_retry_nodes=min(7, nodes - 1),
-                      client_rate=(rate_list[0] + nodes - 1) // nodes,
-                      timeout_delay=max_header_delay)
+                      gc_depth=50, sync_retry_delay=5_000,
+                      sync_retry_nodes=min(3, nodes - 1),
+                      client_rate=client_rate,
+                      timeout_delay=1_000)
         _bench(settings, output_dir).run(bench, params, debug=bool(debug),
                                        consensus_only=bool(consensus_only), update=bool(update))
     except (BenchError, EnvironmentSetupError, TypeError, ValueError) as error:

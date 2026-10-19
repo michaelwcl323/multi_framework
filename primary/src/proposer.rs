@@ -11,9 +11,9 @@ use std::convert::TryInto;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
-// #[cfg(test)]
-// #[path = "tests/proposer_tests.rs"]
-// pub mod proposer_tests;
+#[cfg(test)]
+#[path = "tests/proposer_tests.rs"]
+mod proposer_tests;
 
 /// The proposer creates new headers and send them to the core for broadcasting and further processing.
 pub struct Proposer {
@@ -154,7 +154,12 @@ impl Proposer {
             } else {
                 let duration = self.last_proposal_time.elapsed().as_millis();
                 let num_txns = duration * self.client_rate as u128 / 1000;
-                info!("Block {:?} round {:?} NumTxns {:?}", (self.committee.id() << 20) as u64 + self.round, self.round, num_txns) ;
+                info!(
+                    "Block {:?} round {:?} NumTxns {:?}",
+                    (self.committee.id() << 20) as u64 + self.round,
+                    self.round,
+                    num_txns
+                );
                 payload = vec![vec![0u8; self.tx_size]; num_txns as usize];
             }
         } else {
@@ -240,11 +245,9 @@ impl Proposer {
         tokio::pin!(timer);
 
         loop {
-            // Check if we can propose a new header. We propose a new header when we have a quorum of parents
-            // and one of the following conditions is met:
-            // (i) the timer expired (we timed out on the leader or gave up gather votes for the leader),
-            // (ii) we have enough digests (minimum header size) and we are on the happy path (we can vote for
-            // the leader or the leader has enough votes to enable a commit).
+            // On the normal path, stop waiting for payload when the header deadline expires.
+            // Parent and leader readiness are still required. Certified timeout recovery
+            // remains a separate path when normal advancement is unavailable.
             let enough_parents = !self.last_parents.is_empty();
             let timeout_cert_gathered = self.last_timeout_cert.round == self.round;
             let is_next_leader = self.committee.leader((self.round + 1) as usize) == self.name;
@@ -262,7 +265,7 @@ impl Proposer {
             if ((timer_expired
                 && timeout_cert_gathered
                 && (!is_next_leader || no_vote_cert_gathered))
-                || ((enough_digests || self.consensus_only) && advance))
+                || ((enough_digests || timer_expired || self.consensus_only) && advance))
                 && enough_parents
             {
                 // Advance to the next round.
@@ -280,6 +283,10 @@ impl Proposer {
             }
 
             tokio::select! {
+                // Wake even without messages. Disable the completed timer after
+                // handling its timeout, until the next proposal resets it, so
+                // waiting for certificates cannot busy-loop.
+                () = &mut timer, if !timeout_sent => {}
                 Some((parents, round)) = self.rx_core.recv() => {
                     // Compare the parents' round number with our current round.
                     match round.cmp(&self.round) {

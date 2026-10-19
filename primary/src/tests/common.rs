@@ -3,7 +3,7 @@ use crate::messages::{Certificate, Header, Vote};
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
-use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
+use crypto::{generate_keypair, PublicKey, SecretKey};
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
 use rand::rngs::StdRng;
@@ -33,37 +33,38 @@ pub fn keys() -> Vec<(PublicKey, SecretKey)> {
 
 // Fixture
 pub fn committee() -> Committee {
-    Committee {
-        authorities: keys()
+    let keys = keys();
+    let authorities = keys
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| {
+            let primary = PrimaryAddresses {
+                primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
+                worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
+            };
+            let workers = vec![(
+                0,
+                WorkerAddresses {
+                    primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
+                    transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
+                    worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
+                },
+            )]
             .iter()
-            .enumerate()
-            .map(|(i, (id, _))| {
-                let primary = PrimaryAddresses {
-                    primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
-                    worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
-                };
-                let workers = vec![(
-                    0,
-                    WorkerAddresses {
-                        primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
-                        transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
-                        worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
-                    },
-                )]
-                .iter()
-                .cloned()
-                .collect();
-                (
-                    *id,
-                    Authority {
-                        stake: 1,
-                        primary,
-                        workers,
-                    },
-                )
-            })
-            .collect(),
-    }
+            .cloned()
+            .collect();
+            (
+                *id,
+                Authority {
+                    id: i as u32,
+                    stake: 1,
+                    primary,
+                    workers,
+                },
+            )
+        })
+        .collect();
+    Committee::new(&keys.last().unwrap().0, authorities)
 }
 
 // Fixture.
@@ -94,9 +95,10 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 
 // Fixture
 pub fn header() -> Header {
-    let (author, secret) = keys().pop().unwrap();
+    let (author, _) = keys().pop().unwrap();
     let header = Header {
         author,
+        author_id: committee().authorities[&author].id,
         round: 1,
         parents: Certificate::genesis(&committee())
             .iter()
@@ -106,7 +108,6 @@ pub fn header() -> Header {
     };
     Header {
         id: header.digest(),
-        signature: Signature::new(&header.digest(), &secret),
         ..header
     }
 }
@@ -115,9 +116,10 @@ pub fn header() -> Header {
 pub fn headers() -> Vec<Header> {
     keys()
         .into_iter()
-        .map(|(author, secret)| {
+        .map(|(author, _)| {
             let header = Header {
                 author,
+                author_id: committee().authorities[&author].id,
                 round: 1,
                 parents: Certificate::genesis(&committee())
                     .iter()
@@ -127,7 +129,6 @@ pub fn headers() -> Vec<Header> {
             };
             Header {
                 id: header.digest(),
-                signature: Signature::new(&header.digest(), &secret),
                 ..header
             }
         })
@@ -138,18 +139,13 @@ pub fn headers() -> Vec<Header> {
 pub fn votes(header: &Header) -> Vec<Vote> {
     keys()
         .into_iter()
-        .map(|(author, secret)| {
-            let vote = Vote {
-                id: header.id.clone(),
-                round: header.round,
-                origin: header.author,
-                author,
-                signature: Signature::default(),
-            };
-            Vote {
-                signature: Signature::new(&vote.digest(), &secret),
-                ..vote
-            }
+        .map(|(author, _)| Vote {
+            id: header.id.clone(),
+            sample_txn: header.sample_txn,
+            round: header.round,
+            origin: header.author,
+            origin_id: header.author_id,
+            author,
         })
         .collect()
 }
@@ -157,11 +153,11 @@ pub fn votes(header: &Header) -> Vec<Vote> {
 // Fixture
 pub fn certificate(header: &Header) -> Certificate {
     Certificate {
-        header: header.clone(),
-        votes: votes(&header)
-            .into_iter()
-            .map(|x| (x.author, x.signature))
-            .collect(),
+        header_id: header.id,
+        sample_txn: header.sample_txn,
+        round: header.round,
+        origin: header.author,
+        origin_id: header.author_id,
     }
 }
 

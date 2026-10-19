@@ -41,7 +41,7 @@ def local(ctx, debug=False, consensus_only=True, aggregate=False):
         'tx_size': 512,
         'consensus_only': consensus_only,
         'timeout_delay': 20,  # ms
-        'header_size': 1_000,  # bytes
+        'header_size': 500000,  # bytes
         'gc_depth': 50,  # rounds
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 200,  # ms

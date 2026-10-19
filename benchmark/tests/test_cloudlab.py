@@ -109,10 +109,17 @@ class CloudLabTests(unittest.TestCase):
             bench, params = factory.return_value.run.call_args.args
             self.assertEqual(bench['nodes'], [10])
             self.assertEqual(bench['rate'], [40000, 80000, 120000, 160000, 200000])
-            self.assertEqual(params['batch_size'], 4096 * 500)
-            self.assertEqual(params['header_size'], 4096 * 500)
+            self.assertEqual(bench['runs'], 1)
+            self.assertEqual(bench['duration'], 120)
+            self.assertEqual(bench['tx_size'], 512)
+            self.assertEqual(params['batch_size'], 500_000)
+            self.assertEqual(params['header_size'], 500_000)
             self.assertEqual(params['max_batch_delay'], 200)
-            self.assertEqual(params['max_header_delay'], 200)
+            self.assertEqual(params['max_header_delay'], 3_000)
+            self.assertEqual(params['sync_retry_delay'], 5_000)
+            self.assertEqual(params['sync_retry_nodes'], 3)
+            self.assertEqual(params['timeout_delay'], 1_000)
+            self.assertEqual(params['client_rate'], 450)
             self.assertFalse(params['consensus_only'])
             self.assertNotIn('propose_rate', params)
 
@@ -181,6 +188,27 @@ class CloudLabTests(unittest.TestCase):
 
 
 class CloudLabAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_synthetic_client_rate_is_preserved_but_real_rate_is_shared(self):
+        runner = CloudLabBench.__new__(CloudLabBench)
+        runner._connect_all = AsyncMock(return_value={})
+        runner._close_all = AsyncMock()
+        runner._upload_all = AsyncMock()
+        runner._upload_parameters = AsyncMock()
+        runner._run_single = AsyncMock()
+        runner._download_logs = AsyncMock()
+        bench = BenchParameters(dict(faults=0, nodes=10, workers=1, rate=150000,
+                                     tx_size=512, duration=120, runs=1, burst=50))
+        committee = Committee.from_address_list(
+            OrderedDict((str(i), ['127.0.0.1'] * 2) for i in range(10)), 5000, 0)
+        for consensus_only, expected_rate in ((True, 450), (False, 15000)):
+            with self.subTest(consensus_only=consensus_only):
+                params = NodeParameters(dict(timeout_delay=1000, header_size=1000,
+                                            gc_depth=50, batch_size=500000, client_rate=450))
+                with patch.object(runner, '_generate_config', return_value=(committee, [])), \
+                        patch.object(runner, '_parse_and_store'):
+                    await runner._run([], bench, params, False, consensus_only, False)
+                self.assertEqual(params.json['client_rate'], expected_rate)
+
     async def test_background_process_forces_benchmark_logging(self):
         connection = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(
             exit_status=0, stdout='', stderr='')))

@@ -38,15 +38,28 @@ Edit `cloudlab_tasks.py::cloudlab_remote`, or override its Fabric arguments:
 | --- | ---: | --- |
 | nodes | 10 | One primary and one embedded worker per host |
 | rates | 40000,80000,120000,160000,200000 | Aggregate input transactions/second |
-| runs | 2 | Repetitions at each input rate |
+| runs | 1 | Repetitions at each input rate |
 | duration | 120 | Seconds per run |
-| tx_size | 500 | Bytes per transaction |
-| batch_size | 2048000 | Bytes, equivalent to 4096 transactions |
-| header_size | 2048000 | Payload bytes, equivalent to 4096 transactions |
+| tx_size | 512 | Bytes per transaction |
+| batch_size | 500000 | Preferred batch bytes; seal after reaching the threshold |
+| header_size | 500000 | Payload byte limit; fits 976 complete 512-byte transactions |
 | max_batch_delay | 200 | Milliseconds; seal a partial batch on timeout |
-| max_header_delay | 200 | Milliseconds; proposer timeout, subject to protocol progress |
+| max_header_delay | 3000 | Milliseconds; proposer timeout, subject to protocol progress |
 | burst | 50 | Client burst interval in milliseconds |
 | consensus_only | false | Default uses real benchmark clients |
+
+Protocol defaults above follow `fabfile.py::remote` from
+`aa70da4b1e2a5eea848d538f7177bf64026cfa18`, with `header_size=500000`.
+Other retained defaults include `gc_depth=50`,
+`sync_retry_delay=5000`, `sync_retry_nodes=3`, and `timeout_delay=1000`.
+The CloudLab experiment retains ten hosts, the five input rates, 120 seconds,
+one repetition, and real clients. The historical remote experiment instead defaulted to 40
+nodes, 100 seconds, and synthetic consensus-only load at 450 tx/s per node.
+The historical `client_rate=450` default is retained in the task; in real-client
+mode the runner records the per-node share of the aggregate input rate instead.
+The Rust node does not use `client_rate` to generate payloads in real-client mode.
+Sizes need not be multiples of transaction size; the proposer uses integer
+division to determine how many complete transactions fit in a header.
 
 ```bash
 fab cloudlab-remote --rates='40000,80000,120000,160000,200000' --runs=2
@@ -63,6 +76,22 @@ rate is divided across client endpoints. The runner converts target tx/s into
 the client's `rate/20` transactions-per-burst representation; arbitrary intervals
 can round upward by less than one transaction per burst per client. Each repeat
 starts with empty stores and fresh processes.
+
+With `--consensus-only`, `--client-rate` is the synthetic per-node load and is
+preserved independently of `--rates`. For example, ten nodes with
+`--client-rate=400` target an aggregate 4000 tx/s. No benchmark clients are
+started in this mode. The old unconditional `rate/nodes` assignment must not
+replace this synthetic load.
+
+The Pipes paper's section 6 experiment uses 100 Mbps bandwidth per node and
+100 ms one-way network delay; a JSON `bandwidth` field alone does not enforce
+these limits. The ten-node rerun is documented in
+`results/pipes-consensus-only/report.md`, with its network configuration,
+cleanup evidence, CPU affinity, 30-second warmup, 120-second measurement windows,
+raw logs, and reproducible `run_experiment.py`. Paper figure 7 uses 40 GCP
+instances; the rerun uses the requested ten CloudLab hosts. Its per-node load
+points 400/500/600 tx/s come from the author's `benchmark/run.sh`, since the
+paper does not enumerate the precise input-rate points in its text.
 
 ## Results and latency
 
@@ -102,8 +131,8 @@ metrics, and result archiving. It uses temporary files and does not contact the
 CloudLab inventory. Run CloudLab connectivity/deployment commands to validate
 the actual testbed.
 
-Validation performed for this change: node/client debug build, eleven Python
+Validation performed for the initial CloudLab adaptation: node/client debug build, eleven Python
 CloudLab tests, two batch-maker integration tests, and the four-node smoke run.
-The repository's older `primary/src/tests/common.rs` fixtures refer to removed
-signature/header fields and do not compile as a complete primary unit-test
-suite; the batch regression target above runs independently of those fixtures.
+The proposer deadline update refreshes `primary/src/tests/common.rs` for the
+current message types. Run its deadline and certified-recovery regressions with
+`cargo test --locked --offline -p primary proposer_tests`.

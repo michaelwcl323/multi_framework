@@ -689,7 +689,10 @@ pkill -x benchmark_client 2>/dev/null || true
                 # Every run starts from fresh stores, so rounds and transaction
                 # queues cannot leak from a preceding input-rate point.
                 for rate in bench_parameters.rate:
-                    node_parameters.json['client_rate'] = ceil(rate / (nodes - bench_parameters.faults))
+                    # Synthetic payloads use the configured per-node client_rate.
+                    # The real-client aggregate input rate must not overwrite it.
+                    if not consensus_only:
+                        node_parameters.json['client_rate'] = ceil(rate / (nodes - bench_parameters.faults))
                     await self._upload_parameters(
                         hosts[:nodes],
                         {host: connections[host] for host in hosts[:nodes]},
