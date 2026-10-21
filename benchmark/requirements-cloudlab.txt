@@ -1,0 +1,2 @@
+fabric==2.6.0
+paramiko>=2.12,<3

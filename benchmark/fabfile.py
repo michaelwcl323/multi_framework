@@ -4,9 +4,19 @@ from fabric import task
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print
-from benchmark.plot import Ploter, PlotError
-from benchmark.instance import InstanceManager
-from benchmark.remote import Bench, BenchError
+from benchmark.utils import BenchError
+from benchmark.cloudlab_remote import CloudLabBench
+
+# CloudLab does not need AWS or plotting dependencies.
+try:
+    from benchmark.plot import Ploter, PlotError
+except ImportError:
+    Ploter = PlotError = None
+try:
+    from benchmark.instance import InstanceManager
+    from benchmark.remote import Bench
+except ImportError:
+    InstanceManager = Bench = None
 
 
 @task
@@ -153,3 +163,60 @@ def logs(ctx):
         print(LogParser.process('./logs', faults='?').result())
     except ParseError as e:
         Print.error(BenchError('Failed to parse logs', e))
+
+
+@task
+def cloudlab_info(ctx):
+    ''' Display the configured CloudLab nodes '''
+    from benchmark.cloudlab_instance import CloudLabInstanceManager
+    CloudLabInstanceManager.make().print_info()
+
+
+@task
+def cloudlab_test(ctx):
+    ''' Test SSH connections to every CloudLab node '''
+    CloudLabBench(ctx).test_connections()
+
+
+@task
+def cloudlab_install(ctx):
+    ''' Install dependencies and clone the Narwhal HotStuff branch '''
+    CloudLabBench(ctx).install()
+
+
+@task
+def cloudlab_remote(ctx, debug=False):
+    ''' Run Narwhal HotStuff on CloudLab with the Tusk benchmark workload '''
+    bench_params = {
+        'faults': 0,
+        'nodes': [10],
+        'workers': 1,
+        'collocate': True,
+        'rate': [120_000],
+        'tx_size': 512,
+        'duration': 120,
+        'runs': 1,
+    }
+    node_params = {
+        'timeout_delay': 5_000,  # HotStuff view timeout, ms
+        'header_size': 1_000,
+        'max_header_delay': 200,
+        'gc_depth': 50,
+        'sync_retry_delay': 1_000,
+        'sync_retry_nodes': 3,
+        'batch_size': 500_000,
+        'max_batch_delay': 200,
+    }
+    CloudLabBench(ctx).run(bench_params, node_params, debug)
+
+
+@task
+def cloudlab_status(ctx):
+    ''' Inspect processes on all CloudLab nodes '''
+    CloudLabBench(ctx).status()
+
+
+@task
+def cloudlab_kill(ctx):
+    ''' Stop this Narwhal HotStuff checkout's benchmark processes '''
+    CloudLabBench(ctx).kill()

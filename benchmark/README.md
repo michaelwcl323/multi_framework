@@ -236,3 +236,25 @@ plot_params = {
 The first graph ('latency') plots the latency versus the throughput. It shows that the latency is low until a fairly neat threshold after which it drastically increases. Determining this threshold is crucial to understand the limits of the system. 
 
 Another challenge is comparing apples-to-apples between different deployments of the system. The challenge here is again that latency and throughput are interdependent, as a result a throughput/number of nodes chart could be tricky to produce fairly. The way to do it is to define a maximum latency and measure the throughput at this point instead of simply pushing every system to its peak throughput (where latency is meaningless). The second graph ('tps') plots the maximum achievable throughput under a maximum latency for different numbers of nodes.
+
+# CloudLab: Narwhal HotStuff
+
+From this directory, install the controller dependencies with
+`python3 -m pip install -r requirements-cloudlab.txt`. Copy the CloudLab settings
+from the Tusk checkout to `cloudlab_settings.json`, retaining the SSH key and
+hosts, and set `repo.name` to `multi_framework_narwhal_hs`, `repo.url` to your
+repository URL, and `repo.branch` to `narwhal-hotstuff`. Keep credentials in this
+ignored local file or provide the key passphrase through `SSH_KEY_PASSWORD`.
+
+Run `fab cloudlab-test`, `fab cloudlab-install`, then `fab cloudlab-remote`.
+The default workload matches Tusk: 10 nodes, one collocated worker per node,
+120,000 tx/s total, 512-byte transactions, one run lasting 120 seconds. HotStuff
+also requires a consensus address for each authority and a `timeout_delay`
+parameter (5,000 ms by default); the branch's configuration generator provides
+these. Change benchmark and node parameters in `fabfile.py`.
+
+The runner builds the configured branch in a separate remote checkout. Build
+output is in `benchmark/cloudlab-build.log` on each host. It downloads every
+primary, worker, and client log to local `logs/`, prints the branch's performance
+summary, and saves statistics to `results/`. `fab cloudlab-kill` stops processes
+only from this checkout. SSH connections are closed before log parsing starts.
