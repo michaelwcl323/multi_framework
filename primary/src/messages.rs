@@ -1,64 +1,63 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::primary::Round;
-use config::{Committee, WorkerId};
+use config::Committee;
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 
+#[cfg(test)]
+#[path = "tests/messages_tests.rs"]
+mod messages_tests;
+
+pub type Transaction = Vec<u8>;
+
 #[derive(Clone, Serialize, Deserialize, Default)]
-pub struct Header {
+pub struct Batch {
     pub author: PublicKey,
     pub round: Round,
-    pub payload: BTreeMap<Digest, WorkerId>,
+    pub transactions: Vec<Transaction>,
     pub parents: BTreeSet<Digest>,
     pub id: Digest,
     pub signature: Signature,
 }
 
-impl Header {
+impl Batch {
     pub async fn new(
         author: PublicKey,
         round: Round,
-        payload: BTreeMap<Digest, WorkerId>,
+        transactions: Vec<Transaction>,
         parents: BTreeSet<Digest>,
         signature_service: &mut SignatureService,
     ) -> Self {
-        let header = Self {
+        let batch = Self {
             author,
             round,
-            payload,
+            transactions,
             parents,
             id: Digest::default(),
             signature: Signature::default(),
         };
-        let id = header.digest();
+        let id = batch.digest();
         let signature = signature_service.request_signature(id.clone()).await;
         Self {
             id,
             signature,
-            ..header
+            ..batch
         }
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the header id is well formed.
-        ensure!(self.digest() == self.id, DagError::InvalidHeaderId);
+        // Ensure the batch id is well formed.
+        ensure!(self.digest() == self.id, DagError::InvalidBatchId);
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
         ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author));
-
-        // Ensure all worker ids are correct.
-        for worker_id in self.payload.values() {
-            committee
-                .worker(&self.author, &worker_id)
-                .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
-        }
 
         // Check the signature.
         self.signature
@@ -67,15 +66,17 @@ impl Header {
     }
 }
 
-impl Hash for Header {
+impl Hash for Batch {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
         hasher.update(&self.author);
         hasher.update(self.round.to_le_bytes());
-        for (x, y) in &self.payload {
-            hasher.update(x);
-            hasher.update(y.to_le_bytes());
+        hasher.update((self.transactions.len() as u64).to_le_bytes());
+        for transaction in &self.transactions {
+            hasher.update((transaction.len() as u64).to_le_bytes());
+            hasher.update(transaction);
         }
+        hasher.update((self.parents.len() as u64).to_le_bytes());
         for x in &self.parents {
             hasher.update(x);
         }
@@ -83,7 +84,7 @@ impl Hash for Header {
     }
 }
 
-impl fmt::Debug for Header {
+impl fmt::Debug for Batch {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
@@ -91,12 +92,12 @@ impl fmt::Debug for Header {
             self.id,
             self.round,
             self.author,
-            self.payload.keys().map(|x| x.size()).sum::<usize>(),
+            self.transactions.iter().map(Vec::len).sum::<usize>(),
         )
     }
 }
 
-impl fmt::Display for Header {
+impl fmt::Display for Batch {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "B{}({})", self.round, self.author)
     }
@@ -113,14 +114,14 @@ pub struct Vote {
 
 impl Vote {
     pub async fn new(
-        header: &Header,
+        batch: &Batch,
         author: &PublicKey,
         signature_service: &mut SignatureService,
     ) -> Self {
         let vote = Self {
-            id: header.id.clone(),
-            round: header.round,
-            origin: header.author,
+            id: batch.id.clone(),
+            round: batch.round,
+            origin: batch.author,
             author: *author,
             signature: Signature::default(),
         };
@@ -167,7 +168,7 @@ impl fmt::Debug for Vote {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Certificate {
-    pub header: Header,
+    pub batch: Batch,
     pub votes: Vec<(PublicKey, Signature)>,
 }
 
@@ -177,9 +178,9 @@ impl Certificate {
             .authorities
             .keys()
             .map(|name| Self {
-                header: Header {
+                batch: Batch {
                     author: *name,
-                    ..Header::default()
+                    ..Batch::default()
                 },
                 ..Self::default()
             })
@@ -192,8 +193,8 @@ impl Certificate {
             return Ok(());
         }
 
-        // Check the embedded header.
-        self.header.verify(committee)?;
+        // Check the embedded batch.
+        self.batch.verify(committee)?;
 
         // Ensure the certificate has a quorum.
         let mut weight = 0;
@@ -215,18 +216,18 @@ impl Certificate {
     }
 
     pub fn round(&self) -> Round {
-        self.header.round
+        self.batch.round
     }
 
     pub fn origin(&self) -> PublicKey {
-        self.header.author
+        self.batch.author
     }
 }
 
 impl Hash for Certificate {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.header.id);
+        hasher.update(&self.batch.id);
         hasher.update(self.round().to_le_bytes());
         hasher.update(&self.origin());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
@@ -241,14 +242,14 @@ impl fmt::Debug for Certificate {
             self.digest(),
             self.round(),
             self.origin(),
-            self.header.id
+            self.batch.id
         )
     }
 }
 
 impl PartialEq for Certificate {
     fn eq(&self, other: &Self) -> bool {
-        let mut ret = self.header.id == other.header.id;
+        let mut ret = self.batch.id == other.batch.id;
         ret &= self.round() == other.round();
         ret &= self.origin() == other.origin();
         ret

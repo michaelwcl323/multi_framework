@@ -233,24 +233,6 @@ def collect_logs_via_node0(conn, repo_name, host_info, max_workers=1):
             Print.warn(f'      ⚠ primary-{i}.log not found on node{i}')
         sys.stdout.flush()
         
-        # Collect worker logs
-        for j in range(max_workers):
-            remote_log = f'{repo_name}/{PathMaker.worker_log_file(i, j)}'
-            local_log_on_node0 = f'{node_dir}/worker-{i}-{j}.log'
-            
-            if i == 0:
-                result = conn.run(f'cp {remote_log} {local_log_on_node0} 2>/dev/null || echo "not_found"', 
-                                hide=True, warn=True)
-            else:
-                result = conn.run(
-                    f'scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 '
-                    f'{username}@{hostname}:{remote_log} {local_log_on_node0} 2>&1 || echo "not_found"',
-                    hide=True, warn=True
-                )
-            
-            if 'not_found' not in result.stdout and conn.run(f'test -f {local_log_on_node0}', hide=True, warn=True).ok:
-                node_logs.append(local_log_on_node0)
-        
         # Collect client logs
         for j in range(max_workers):
             remote_log = f'{repo_name}/{PathMaker.client_log_file(i, j)}'
@@ -435,14 +417,6 @@ def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh
                     Print.info(f'    ✓ Downloaded primary-{i}.log')
                 else:
                     Print.warn(f'    ⚠ primary-{i}.log not found or failed to download')
-                
-                # Download worker logs
-                for j in range(max_workers):
-                    remote_log = f'{repo_name}/{PathMaker.worker_log_file(i, j)}'
-                    log_filename = f'worker-{i}-{j}.log'
-                    local_log_path = logs_dir / log_filename
-                    
-                    download_file_with_fresh_conn(remote_log, local_log_path, f'worker-{i}-{j}.log')
                 
                 # Download client logs
                 for j in range(max_workers):

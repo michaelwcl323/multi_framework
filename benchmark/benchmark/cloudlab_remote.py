@@ -1191,9 +1191,9 @@ class CloudLabBench:
 if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
 if [ ! -f ./target/release/node ] || [ ! -f ./target/release/benchmark_client ]; then
     if rustup run stable cargo --version >/dev/null 2>&1; then
-        rustup run stable cargo build --release --bin node --bin benchmark_client
+        rustup run stable cargo build --release --features benchmark --bin node --bin benchmark_client
     else
-        cargo build --release --bin node --bin benchmark_client
+        cargo build --release --features benchmark --bin node --bin benchmark_client
     fi
 fi
 [ -f ./target/release/benchmark_client ] && [ ! -f ./benchmark_client ] && ln -sf ./target/release/benchmark_client ./benchmark_client || true
@@ -1222,11 +1222,8 @@ test -x ./target/release/node && (test -x ./benchmark_client || test -x ./target
             
             # Resolve command binary path on remote host. In repo root, "node" is a directory,
             # so "./node" may be invalid; prefer target/release binaries.
-            resolved_command = command
-            if command.startswith('./node '):
-                resolved_command = command.replace('./node ', '${NODE_BIN} ', 1)
-            elif command.startswith('./benchmark_client '):
-                resolved_command = command.replace('./benchmark_client ', '${CLIENT_BIN} ', 1)
+            resolved_command = command.replace('./node ', '"${NODE_BIN}" ', 1)
+            resolved_command = resolved_command.replace('./benchmark_client ', '"${CLIENT_BIN}" ', 1)
 
             # Write script with better error handling
             # Use relative path after cd to repo directory
@@ -1247,7 +1244,7 @@ mkdir -p $(dirname {log_file}) 2>/dev/null || true
 # Cleanup database directory and lock files before starting
 {cleanup_store}
 
-# Resolve runtime binaries (for client/worker/primary)
+# Resolve runtime binaries for clients and complete nodes
 if [[ "{name}" == client-* ]]; then
     if [ -x "./benchmark_client" ]; then
         CLIENT_BIN="./benchmark_client"
@@ -1259,7 +1256,7 @@ if [[ "{name}" == client-* ]]; then
         echo "Files in current dir: $(ls -la | head -10)" | tee -a {log_file}
         exit 1
     fi
-elif [[ "{name}" == worker-* ]] || [[ "{name}" == primary-* ]]; then
+elif [[ "{name}" == primary-* ]]; then
     if [ -x "./target/release/node" ]; then
         NODE_BIN="./target/release/node"
     elif [ -x "./node" ] && [ ! -d "./node" ]; then
@@ -1463,26 +1460,6 @@ SCRIPTEOF'''
             )
             log_file = PathMaker.primary_log_file(i)
             self._background_run(host_info, cmd, log_file)
-
-        # 4. Run the workers (except the faulty ones) – same as Bench._run_single
-        Print.info('Booting workers...')
-        for i, addresses in enumerate(workers_addresses):
-            for (id, address) in addresses:
-                host_info = self._get_host_by_address(address, selected_hosts)
-                if not host_info:
-                    Print.warn(f'Could not find host for address {address}')
-                    continue
-
-                cmd = CommandMaker.run_worker(
-                    PathMaker.key_file(i),
-                    PathMaker.committee_file(),
-                    PathMaker.db_path(i, id),
-                    PathMaker.parameters_file(),
-                    id,  # The worker's id.
-                    debug=debug
-                )
-                log_file = PathMaker.worker_log_file(i, id)
-                self._background_run(host_info, cmd, log_file)
 
         # 5. Wait for all transactions to be processed (progress output)
         duration = bench_parameters.duration

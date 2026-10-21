@@ -3,13 +3,12 @@ use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
-use config::{Committee, KeyPair, Parameters, WorkerId};
+use config::{Committee, KeyPair, Parameters};
 use consensus::Consensus;
 use env_logger::Env;
 use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
-use worker::Worker;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -18,7 +17,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("A research implementation of Narwhal and Tusk.")
+        .about("Tusk ordering of complete batch proposals.")
         .args_from_usage("-v... 'Sets the level of verbosity'")
         .subcommand(
             SubCommand::with_name("generate_keys")
@@ -32,11 +31,9 @@ async fn main() -> Result<()> {
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
-                .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
                 .subcommand(
-                    SubCommand::with_name("worker")
-                        .about("Run a single worker")
-                        .args_from_usage("--id=<INT> 'The worker id'"),
+                    SubCommand::with_name("primary")
+                        .about("Run a complete node with direct batch proposals"),
                 )
                 .setting(AppSettings::SubcommandRequiredElseHelp),
         )
@@ -65,7 +62,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Runs either a worker or a primary.
+// Runs a complete authority in one process.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let key_file = matches.value_of("keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
@@ -85,13 +82,27 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         None => Parameters::default(),
     };
 
+    // The legacy address map supplies client ingress on the primary host.
+    for authority in committee.authorities.values() {
+        anyhow::ensure!(
+            authority.workers.len() == 1 && authority.workers.contains_key(&0),
+            "Direct-batch nodes require exactly one client endpoint (workers entry 0)"
+        );
+        let addresses = &authority.workers[&0];
+        let host = authority.primary.primary_to_primary.ip();
+        anyhow::ensure!(
+            addresses.transactions.ip() == host,
+            "Transaction endpoint must be on the primary's host"
+        );
+    }
+
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
-    // Check whether to run a primary, a worker, or an entire authority.
+    // The primary command runs all authority tasks in this process.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
@@ -101,7 +112,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 keypair,
                 committee.clone(),
                 parameters.clone(),
-                store,
+                store.clone(),
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
@@ -114,15 +125,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             );
         }
 
-        // Spawn a single worker.
-        ("worker", Some(sub_matches)) => {
-            let id = sub_matches
-                .value_of("id")
-                .unwrap()
-                .parse::<WorkerId>()
-                .context("The worker id must be a positive integer")?;
-            Worker::spawn(keypair.name, id, committee, parameters, store);
-        }
         _ => unreachable!(),
     }
 

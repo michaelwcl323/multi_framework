@@ -142,7 +142,7 @@ impl Consensus {
                 .get(&(r - 1))
                 .expect("We should have the whole history by now")
                 .values()
-                .filter(|(_, x)| x.header.parents.contains(&leader_digest))
+                .filter(|(_, x)| x.batch.parents.contains(&leader_digest))
                 .map(|(_, x)| self.committee.stake(&x.origin()))
                 .sum();
 
@@ -178,12 +178,14 @@ impl Consensus {
             // Output the sequence in the right order.
             for certificate in sequence {
                 #[cfg(not(feature = "benchmark"))]
-                info!("Committed {}", certificate.header);
+                info!("Committed {}", certificate.batch);
 
                 #[cfg(feature = "benchmark")]
-                for digest in certificate.header.payload.keys() {
-                    // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", certificate.header, digest);
+                if !certificate.batch.transactions.is_empty() {
+                    info!(
+                        "Committed {} -> {:?}",
+                        certificate.batch, certificate.batch.id
+                    );
                 }
 
                 self.tx_primary
@@ -249,7 +251,7 @@ impl Consensus {
                 .get(&(r))
                 .expect("We should have the whole history by now")
                 .values()
-                .filter(|(digest, _)| parents.iter().any(|x| x.header.parents.contains(digest)))
+                .filter(|(digest, _)| parents.iter().any(|x| x.batch.parents.contains(digest)))
                 .map(|(_, certificate)| certificate)
                 .collect();
         }
@@ -267,7 +269,7 @@ impl Consensus {
         while let Some(x) = buffer.pop() {
             debug!("Sequencing {:?}", x);
             ordered.push(x.clone());
-            for parent in &x.header.parents {
+            for parent in &x.batch.parents {
                 let (digest, certificate) = match state
                     .dag
                     .get(&(x.round() - 1))

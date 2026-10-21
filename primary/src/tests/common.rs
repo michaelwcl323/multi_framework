@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, Header, Vote};
+use crate::messages::{Batch, Certificate, Vote};
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-impl PartialEq for Header {
+impl PartialEq for Batch {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
@@ -93,56 +93,57 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 }
 
 // Fixture
-pub fn header() -> Header {
+pub fn batch() -> Batch {
     let (author, secret) = keys().pop().unwrap();
-    let header = Header {
+    let batch = Batch {
         author,
         round: 1,
+        transactions: vec![vec![0; 100], vec![1; 100]],
         parents: Certificate::genesis(&committee())
             .iter()
             .map(|x| x.digest())
             .collect(),
-        ..Header::default()
+        ..Batch::default()
     };
-    Header {
-        id: header.digest(),
-        signature: Signature::new(&header.digest(), &secret),
-        ..header
+    Batch {
+        id: batch.digest(),
+        signature: Signature::new(&batch.digest(), &secret),
+        ..batch
     }
 }
 
 // Fixture
-pub fn headers() -> Vec<Header> {
+pub fn batches() -> Vec<Batch> {
     keys()
         .into_iter()
         .map(|(author, secret)| {
-            let header = Header {
+            let batch = Batch {
                 author,
                 round: 1,
                 parents: Certificate::genesis(&committee())
                     .iter()
                     .map(|x| x.digest())
                     .collect(),
-                ..Header::default()
+                ..Batch::default()
             };
-            Header {
-                id: header.digest(),
-                signature: Signature::new(&header.digest(), &secret),
-                ..header
+            Batch {
+                id: batch.digest(),
+                signature: Signature::new(&batch.digest(), &secret),
+                ..batch
             }
         })
         .collect()
 }
 
 // Fixture
-pub fn votes(header: &Header) -> Vec<Vote> {
+pub fn votes(batch: &Batch) -> Vec<Vote> {
     keys()
         .into_iter()
         .map(|(author, secret)| {
             let vote = Vote {
-                id: header.id.clone(),
-                round: header.round,
-                origin: header.author,
+                id: batch.id.clone(),
+                round: batch.round,
+                origin: batch.author,
                 author,
                 signature: Signature::default(),
             };
@@ -155,10 +156,10 @@ pub fn votes(header: &Header) -> Vec<Vote> {
 }
 
 // Fixture
-pub fn certificate(header: &Header) -> Certificate {
+pub fn certificate(batch: &Batch) -> Certificate {
     Certificate {
-        header: header.clone(),
-        votes: votes(&header)
+        batch: batch.clone(),
+        votes: votes(&batch)
             .into_iter()
             .map(|x| (x.author, x.signature))
             .collect(),

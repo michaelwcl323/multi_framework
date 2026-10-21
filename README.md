@@ -1,60 +1,72 @@
-# Narwhal and Tusk 
+# ISS branch: direct batch proposals with Tusk ordering
 
-[![build status](https://img.shields.io/github/workflow/status/asonnino/narwhal/Rust/master?style=flat-square&logo=github)](https://github.com/asonnino/narwhal/actions)
-[![rustc](https://img.shields.io/badge/rustc-1.51+-blue?style=flat-square&logo=rust)](https://www.rust-lang.org)
-[![license](https://img.shields.io/badge/license-Apache-blue.svg?style=flat-square)](LICENSE)
+Each authority runs a single node process. Client transactions are assembled
+straight into a signed `Batch` proposal containing the full transaction bytes,
+author, DAG round, and parent certificate references. The node broadcasts that
+complete proposal directly to its peers.
 
-This repo provides an implementation of [Narwhal and Tusk](https://arxiv.org/pdf/2105.11827.pdf). The codebase has been designed to be small, efficient, and easy to benchmark and modify. It has not been designed to run in production but uses real cryptography ([dalek](https://doc.dalek.rs/ed25519_dalek)), networking ([tokio](https://docs.rs/tokio)), and storage ([rocksdb](https://docs.rs/rocksdb)).
+There is no separate batch-data broadcast, pre-distribution ACK quorum,
+batch-digest aggregation, or `Header` object. Peers verify and store the complete
+proposal before voting. A quorum of signed votes certifies that same batch;
+Tusk orders its certificate in the DAG. The ISS ordering protocol itself is not
+yet implemented in this branch.
 
-## Quick Start
-The core protocols are written in Rust, but all benchmarking scripts are written in Python and run with [Fabric](http://www.fabfile.org/).
-To deploy and benchmark a testbed of 4 nodes on your local machine, clone the repo and install the python dependencies:
-```
-$ git clone https://github.com/asonnino/narwhal.git
-$ cd narwhal/benchmark
-$ pip install -r requirements.txt
-```
-You also need to install Clang (required by rocksdb) and [tmux](https://linuxize.com/post/getting-started-with-tmux/#installing-tmux) (which runs all nodes and clients in the background). Finally, run a local benchmark using fabric:
-```
-$ fab local
-```
-This command may take a long time the first time you run it (compiling rust code in `release` mode may be slow) and you can customize a number of benchmark parameters in `fabfile.py`. When the benchmark terminates, it displays a summary of the execution similarly to the one below.
-```
------------------------------------------
- SUMMARY:
------------------------------------------
- + CONFIG:
- Faults: 0 node(s)
- Committee size: 4 node(s)
- Worker(s) per node: 1 worker(s)
- Collocate primary and workers: True
- Input rate: 50,000 tx/s
- Transaction size: 512 B
- Execution time: 19 s
-
- Header size: 1,000 B
- Max header delay: 100 ms
- GC depth: 50 round(s)
- Sync retry delay: 10,000 ms
- Sync retry nodes: 3 node(s)
- batch size: 500,000 B
- Max batch delay: 100 ms
-
- + RESULTS:
- Consensus TPS: 46,478 tx/s
- Consensus BPS: 23,796,531 B/s
- Consensus latency: 464 ms
-
- End-to-end TPS: 46,149 tx/s
- End-to-end BPS: 23,628,541 B/s
- End-to-end latency: 557 ms
------------------------------------------
+```text
+Client transactions
+  -> proposer batches transactions + DAG metadata
+  -> broadcast complete Batch
+  -> peers verify/store Batch and vote
+  -> Certificate { batch, votes }
+  -> existing Tusk DAG ordering
 ```
 
-## Next Steps
-The next step is to read the paper [Narwhal and Tusk: A DAG-based Mempool and Efficient BFT Consensus](https://arxiv.org/pdf/2105.11827.pdf). It is then recommended to have a look at the README files of the [worker](https://github.com/asonnino/narwhal/tree/master/worker) and [primary](https://github.com/asonnino/narwhal/tree/master/primary) crates. An additional resource to better understand the Tusk consensus protocol is the paper [All You Need is DAG](https://arxiv.org/abs/2102.08325) as it describes a similar protocol. 
+Transport ACKs still support reliable retransmission. They are not an
+availability-quorum phase and do not gate proposal construction. Certificates
+currently include the complete batch, so certificate dissemination also sends
+transaction bytes. Empty batches allow DAG rounds to advance while traffic is
+idle. Missing parent certificates are fetched from peers; there is no separate
+transaction-payload lookup.
 
-The README file of the [benchmark folder](https://github.com/asonnino/narwhal/tree/master/benchmark) explains how to benchmark the codebase and read benchmarks' results. It also provides a step-by-step tutorial to run benchmarks on [Amazon Web Services (AWS)](https://aws.amazon.com) accross multiple data centers (WAN).
+## Run locally
+
+From `benchmark`, run `fab local`. The runner builds the binaries, starts one
+node and one client per authority, and parses primary/client logs. To run an
+individual authority after generating keys and a committee:
+
+```bash
+cargo build --release --features benchmark
+./target/release/node -vv run --keys keys.json --committee committee.json \
+    --parameters parameters.json --store .db-node primary
+```
+
+`batch_size` counts transaction bytes and `max_batch_delay` controls when a
+partial/empty proposal may be made. Both proposal triggers also require parent
+certificates from the previous DAG round. Client intake applies backpressure
+once the pending batch reaches its size threshold. `header_size` and
+`max_header_delay` have been removed; old JSON files containing them are still
+accepted, but those extra fields have no effect.
+
+For committee-format compatibility, `workers["0"].transactions` remains the
+client-ingress address on the primary host. All proposal, vote, certificate,
+and parent-sync traffic uses `primary.primary_to_primary`. The legacy
+`worker_to_primary`, `primary_to_worker`, and `worker_to_worker` ports are unused.
+Benchmark parameters retain `workers=1` and `collocate=True`; no worker process
+or standalone worker command exists. The former worker/batch-service crates
+have been removed.
+
+## Validation
+
+```bash
+cargo test --workspace --release --all-features
+cd benchmark
+python3 -m unittest discover -s tests -v
+fab local
+```
+
+This is a research prototype derived from Narwhal/Tusk. Its transaction-carrying
+proposal and certificate wire formats differ from upstream; use fresh stores
+and a homogeneous cluster running this branch.
 
 ## License
-This software is licensed as [Apache 2.0](LICENSE).
+
+[Apache 2.0](LICENSE).

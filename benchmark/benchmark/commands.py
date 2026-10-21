@@ -32,18 +32,9 @@ class CommandMaker:
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
-        return (f'./node {v} run --keys {keys} --committee {committee} '
+        level = 'debug' if debug else 'info'
+        return (f'env RUST_LOG={level} ./node {v} run --keys {keys} --committee {committee} '
                 f'--store {store} --parameters {parameters} primary')
-
-    @staticmethod
-    def run_worker(keys, committee, store, parameters, id, debug=False):
-        assert isinstance(keys, str)
-        assert isinstance(committee, str)
-        assert isinstance(parameters, str)
-        assert isinstance(debug, bool)
-        v = '-vvv' if debug else '-vv'
-        return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} worker --id {id}')
 
     @staticmethod
     def run_client(address, size, rate, nodes):
@@ -53,7 +44,7 @@ class CommandMaker:
         assert isinstance(nodes, list)
         assert all(isinstance(x, str) for x in nodes)
         nodes = f'--nodes {" ".join(nodes)}' if nodes else ''
-        return f'./benchmark_client {address} --size {size} --rate {rate} {nodes}'
+        return f'env RUST_LOG=info ./benchmark_client {address} --size {size} --rate {rate} {nodes}'
 
     @staticmethod
     def kill():

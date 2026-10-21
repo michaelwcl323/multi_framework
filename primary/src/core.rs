@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{CertificatesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, Header, Vote};
+use crate::messages::{Batch, Certificate, Vote};
 use crate::primary::{PrimaryMessage, Round};
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
@@ -28,23 +28,23 @@ pub struct Core {
     committee: Committee,
     /// The persistent storage.
     store: Store,
-    /// Handles synchronization with other nodes and our workers.
+    /// Handles synchronization of parent certificates with other nodes.
     synchronizer: Synchronizer,
-    /// Service to sign headers.
+    /// Service to sign batches.
     signature_service: SignatureService,
     /// The current consensus round (used for cleanup).
     consensus_round: Arc<AtomicU64>,
     /// The depth of the garbage collector.
     gc_depth: Round,
 
-    /// Receiver for dag messages (headers, votes, certificates).
+    /// Receiver for dag messages (batches, votes, certificates).
     rx_primaries: Receiver<PrimaryMessage>,
-    /// Receives loopback headers from the `HeaderWaiter`.
-    rx_header_waiter: Receiver<Header>,
+    /// Receives loopback batches from the `BatchWaiter`.
+    rx_batch_waiter: Receiver<Batch>,
     /// Receives loopback certificates from the `CertificateWaiter`.
     rx_certificate_waiter: Receiver<Certificate>,
-    /// Receives our newly created headers from the `Proposer`.
-    rx_proposer: Receiver<Header>,
+    /// Receives our newly created batches from the `Proposer`.
+    rx_proposer: Receiver<Batch>,
     /// Output all certificates to the consensus layer.
     tx_consensus: Sender<Certificate>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
@@ -52,17 +52,17 @@ pub struct Core {
 
     /// The last garbage collected round.
     gc_round: Round,
-    /// The authors of the last voted headers.
+    /// The authors of the last voted batches.
     last_voted: HashMap<Round, HashSet<PublicKey>>,
-    /// The set of headers we are currently processing.
+    /// The set of batches we are currently processing.
     processing: HashMap<Round, HashSet<Digest>>,
-    /// The last header we proposed (for which we are waiting votes).
-    current_header: Header,
+    /// The last batch we proposed (for which we are waiting votes).
+    current_batch: Batch,
     /// Aggregates votes into a certificate.
     votes_aggregator: VotesAggregator,
-    /// Aggregates certificates to use as parents for new headers.
+    /// Aggregates certificates to use as parents for new batches.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
-    /// A network sender to send the batches to the other workers.
+    /// Broadcasts complete proposals and their votes/certificates.
     network: ReliableSender,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
@@ -79,9 +79,9 @@ impl Core {
         consensus_round: Arc<AtomicU64>,
         gc_depth: Round,
         rx_primaries: Receiver<PrimaryMessage>,
-        rx_header_waiter: Receiver<Header>,
+        rx_batch_waiter: Receiver<Batch>,
         rx_certificate_waiter: Receiver<Certificate>,
-        rx_proposer: Receiver<Header>,
+        rx_proposer: Receiver<Batch>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
     ) {
@@ -95,7 +95,7 @@ impl Core {
                 consensus_round,
                 gc_depth,
                 rx_primaries,
-                rx_header_waiter,
+                rx_batch_waiter,
                 rx_certificate_waiter,
                 rx_proposer,
                 tx_consensus,
@@ -103,7 +103,7 @@ impl Core {
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
-                current_header: Header::default(),
+                current_batch: Batch::default(),
                 votes_aggregator: VotesAggregator::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
@@ -114,45 +114,45 @@ impl Core {
         });
     }
 
-    async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
+    async fn process_own_batch(&mut self, batch: Batch) -> DagResult<()> {
         // Reset the votes aggregator.
-        self.current_header = header.clone();
+        self.current_batch = batch.clone();
         self.votes_aggregator = VotesAggregator::new();
 
-        // Broadcast the new header in a reliable manner.
+        // Broadcast the new batch in a reliable manner.
         let addresses = self
             .committee
             .others_primaries(&self.name)
             .iter()
             .map(|(_, x)| x.primary_to_primary)
             .collect();
-        let bytes = bincode::serialize(&PrimaryMessage::Header(header.clone()))
-            .expect("Failed to serialize our own header");
+        let bytes = bincode::serialize(&PrimaryMessage::Batch(batch.clone()))
+            .expect("Failed to serialize our own batch");
         let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
         self.cancel_handlers
-            .entry(header.round)
+            .entry(batch.round)
             .or_insert_with(Vec::new)
             .extend(handlers);
 
-        // Process the header.
-        self.process_header(&header).await
+        // Process the batch.
+        self.process_batch(&batch).await
     }
 
     #[async_recursion]
-    async fn process_header(&mut self, header: &Header) -> DagResult<()> {
-        debug!("Processing {:?}", header);
-        // Indicate that we are processing this header.
+    async fn process_batch(&mut self, batch: &Batch) -> DagResult<()> {
+        debug!("Processing {:?}", batch);
+        // Indicate that we are processing this batch.
         self.processing
-            .entry(header.round)
+            .entry(batch.round)
             .or_insert_with(HashSet::new)
-            .insert(header.id.clone());
+            .insert(batch.id.clone());
 
         // Ensure we have the parents. If at least one parent is missing, the synchronizer returns an empty
         // vector; it will gather the missing parents (as well as all ancestors) from other nodes and then
-        // reschedule processing of this header.
-        let parents = self.synchronizer.get_parents(header).await?;
+        // reschedule processing of this batch.
+        let parents = self.synchronizer.get_parents(batch).await?;
         if parents.is_empty() {
-            debug!("Processing of {} suspended: missing parent(s)", header.id);
+            debug!("Processing of {} suspended: missing parent(s)", batch.id);
             return Ok(());
         }
 
@@ -160,36 +160,34 @@ impl Core {
         let mut stake = 0;
         for x in parents {
             ensure!(
-                x.round() + 1 == header.round,
-                DagError::MalformedHeader(header.id.clone())
+                x.round() + 1 == batch.round,
+                DagError::MalformedBatch(batch.id.clone())
             );
             stake += self.committee.stake(&x.origin());
         }
         ensure!(
             stake >= self.committee.quorum_threshold(),
-            DagError::HeaderRequiresQuorum(header.id.clone())
+            DagError::BatchRequiresQuorum(batch.id.clone())
         );
 
-        // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
-        // reschedule processing of this header once we have it.
-        if self.synchronizer.missing_payload(header).await? {
-            debug!("Processing of {} suspended: missing payload", header);
-            return Ok(());
-        }
+        // Store the batch.
+        let bytes = bincode::serialize(batch).expect("Failed to serialize batch");
+        self.store.write(batch.id.to_vec(), bytes.clone()).await;
+        // A vote confirms storage of the complete proposal.
+        ensure!(
+            self.store.read(batch.id.to_vec()).await?.as_deref() == Some(bytes.as_slice()),
+            DagError::BatchStorageFailure
+        );
 
-        // Store the header.
-        let bytes = bincode::serialize(header).expect("Failed to serialize header");
-        self.store.write(header.id.to_vec(), bytes).await;
-
-        // Check if we can vote for this header.
+        // Check if we can vote for this batch.
         if self
             .last_voted
-            .entry(header.round)
+            .entry(batch.round)
             .or_insert_with(HashSet::new)
-            .insert(header.author)
+            .insert(batch.author)
         {
-            // Make a vote and send it to the header's creator.
-            let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
+            // Make a vote and send it to the batch's creator.
+            let vote = Vote::new(batch, &self.name, &mut self.signature_service).await;
             debug!("Created {:?}", vote);
             if vote.origin == self.name {
                 self.process_vote(vote)
@@ -198,14 +196,14 @@ impl Core {
             } else {
                 let address = self
                     .committee
-                    .primary(&header.author)
-                    .expect("Author of valid header is not in the committee")
+                    .primary(&batch.author)
+                    .expect("Author of valid batch is not in the committee")
                     .primary_to_primary;
                 let bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
                     .expect("Failed to serialize our own vote");
                 let handler = self.network.send(address, Bytes::from(bytes)).await;
                 self.cancel_handlers
-                    .entry(header.round)
+                    .entry(batch.round)
                     .or_insert_with(Vec::new)
                     .push(handler);
             }
@@ -220,7 +218,7 @@ impl Core {
         // Add it to the votes' aggregator and try to make a new certificate.
         if let Some(certificate) =
             self.votes_aggregator
-                .append(vote, &self.committee, &self.current_header)?
+                .append(vote, &self.committee, &self.current_batch)?
         {
             debug!("Assembled {:?}", certificate);
 
@@ -251,17 +249,17 @@ impl Core {
     async fn process_certificate(&mut self, certificate: Certificate) -> DagResult<()> {
         debug!("Processing {:?}", certificate);
 
-        // Process the header embedded in the certificate if we haven't already voted for it (if we already
-        // voted, it means we already processed it). Since this header got certified, we are sure that all
+        // Process the batch embedded in the certificate if we haven't already voted for it (if we already
+        // voted, it means we already processed it). Since this batch got certified, we are sure that all
         // the data it refers to (ie. its payload and its parents) are available. We can thus continue the
         // processing of the certificate even if we don't have them in store right now.
         if !self
             .processing
-            .get(&certificate.header.round)
-            .map_or_else(|| false, |x| x.contains(&certificate.header.id))
+            .get(&certificate.batch.round)
+            .map_or_else(|| false, |x| x.contains(&certificate.batch.id))
         {
             // This function may still throw an error if the storage fails.
-            self.process_header(&certificate.header).await?;
+            self.process_batch(&certificate.batch).await?;
         }
 
         // Ensure we have all the ancestors of this certificate yet. If we don't, the synchronizer will gather
@@ -278,7 +276,7 @@ impl Core {
         let bytes = bincode::serialize(&certificate).expect("Failed to serialize certificate");
         self.store.write(certificate.digest().to_vec(), bytes).await;
 
-        // Check if we have enough certificates to enter a new dag round and propose a header.
+        // Check if we have enough certificates to enter a new dag round and propose a batch.
         if let Some(parents) = self
             .certificates_aggregators
             .entry(certificate.round())
@@ -293,7 +291,7 @@ impl Core {
         }
 
         // Send it to the consensus layer.
-        let id = certificate.header.id.clone();
+        let id = certificate.batch.id.clone();
         if let Err(e) = self.tx_consensus.send(certificate).await {
             warn!(
                 "Failed to deliver certificate {} to the consensus: {}",
@@ -303,31 +301,31 @@ impl Core {
         Ok(())
     }
 
-    fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
+    fn sanitize_batch(&mut self, batch: &Batch) -> DagResult<()> {
         ensure!(
-            self.gc_round <= header.round,
-            DagError::TooOld(header.id.clone(), header.round)
+            self.gc_round <= batch.round,
+            DagError::TooOld(batch.id.clone(), batch.round)
         );
 
-        // Verify the header's signature.
-        header.verify(&self.committee)?;
+        // Verify the batch's signature.
+        batch.verify(&self.committee)?;
 
-        // TODO [issue #3]: Prevent bad nodes from sending junk headers with high round numbers.
+        // TODO [issue #3]: Prevent bad nodes from sending junk batches with high round numbers.
 
         Ok(())
     }
 
     fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
         ensure!(
-            self.current_header.round <= vote.round,
+            self.current_batch.round <= vote.round,
             DagError::TooOld(vote.digest(), vote.round)
         );
 
-        // Ensure we receive a vote on the expected header.
+        // Ensure we receive a vote on the expected batch.
         ensure!(
-            vote.id == self.current_header.id
-                && vote.origin == self.current_header.author
-                && vote.round == self.current_header.round,
+            vote.id == self.current_batch.id
+                && vote.origin == self.current_batch.author
+                && vote.round == self.current_batch.round,
             DagError::UnexpectedVote(vote.id.clone())
         );
 
@@ -341,7 +339,7 @@ impl Core {
             DagError::TooOld(certificate.digest(), certificate.round())
         );
 
-        // Verify the certificate (and the embedded header).
+        // Verify the certificate (and the embedded batch).
         certificate.verify(&self.committee).map_err(DagError::from)
     }
 
@@ -352,9 +350,9 @@ impl Core {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
                     match message {
-                        PrimaryMessage::Header(header) => {
-                            match self.sanitize_header(&header) {
-                                Ok(()) => self.process_header(&header).await,
+                        PrimaryMessage::Batch(batch) => {
+                            match self.sanitize_batch(&batch) {
+                                Ok(()) => self.process_batch(&batch).await,
                                 error => error
                             }
 
@@ -375,17 +373,17 @@ impl Core {
                     }
                 },
 
-                // We receive here loopback headers from the `HeaderWaiter`. Those are headers for which we interrupted
+                // We receive here loopback batches from the `BatchWaiter`. Those are batches for which we interrupted
                 // execution (we were missing some of their dependencies) and we are now ready to resume processing.
-                Some(header) = self.rx_header_waiter.recv() => self.process_header(&header).await,
+                Some(batch) = self.rx_batch_waiter.recv() => self.process_batch(&batch).await,
 
                 // We receive here loopback certificates from the `CertificateWaiter`. Those are certificates for which
                 // we interrupted execution (we were missing some of their ancestors) and we are now ready to resume
                 // processing.
                 Some(certificate) = self.rx_certificate_waiter.recv() => self.process_certificate(certificate).await,
 
-                // We also receive here our new headers created by the `Proposer`.
-                Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
+                // We also receive here our new batches created by the `Proposer`.
+                Some(batch) = self.rx_proposer.recv() => self.process_own_batch(batch).await,
             };
             match result {
                 Ok(()) => (),

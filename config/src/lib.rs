@@ -60,12 +60,6 @@ pub type WorkerId = u32;
 
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
-    /// The preferred header size. The primary creates a new header when it has enough parents and
-    /// enough batches' digests to reach `header_size`. Denominated in bytes.
-    pub header_size: usize,
-    /// The maximum delay that the primary waits between generating two headers, even if the header
-    /// did not reach `max_header_size`. Denominated in ms.
-    pub max_header_delay: u64,
     /// The depth of the garbage collection (Denominated in number of rounds).
     pub gc_depth: u64,
     /// The delay after which the synchronizer retries to send sync requests. Denominated in ms.
@@ -73,10 +67,10 @@ pub struct Parameters {
     /// Determine with how many nodes to sync when re-trying to send sync-request. These nodes
     /// are picked at random from the committee.
     pub sync_retry_nodes: usize,
-    /// The preferred batch size. The workers seal a batch of transactions when it reaches this size.
+    /// Preferred transaction-byte size of a complete DAG batch proposal.
     /// Denominated in bytes.
     pub batch_size: usize,
-    /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
+    /// The delay after which the proposer seals a batch, even if `batch_size`
     /// is not reached. Denominated in ms.
     pub max_batch_delay: u64,
 }
@@ -84,8 +78,6 @@ pub struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            header_size: 1_000,
-            max_header_delay: 100,
             gc_depth: 50,
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
@@ -99,8 +91,6 @@ impl Import for Parameters {}
 
 impl Parameters {
     pub fn log(&self) {
-        info!("Header size set to {} B", self.header_size);
-        info!("Max header delay set to {} ms", self.max_header_delay);
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay);
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
@@ -113,7 +103,7 @@ impl Parameters {
 pub struct PrimaryAddresses {
     /// Address to receive messages from other primaries (WAN).
     pub primary_to_primary: SocketAddr,
-    /// Address to receive messages from our workers (LAN).
+    /// Legacy field retained for committee compatibility; the port is unused.
     pub worker_to_primary: SocketAddr,
 }
 
@@ -121,9 +111,9 @@ pub struct PrimaryAddresses {
 pub struct WorkerAddresses {
     /// Address to receive client transactions (WAN).
     pub transactions: SocketAddr,
-    /// Address to receive messages from other workers (WAN).
+    /// Legacy unused data port; complete batches use primary_to_primary.
     pub worker_to_worker: SocketAddr,
-    /// Address to receive messages from our primary (LAN).
+    /// Legacy field retained for committee compatibility; the port is unused.
     pub primary_to_worker: SocketAddr,
 }
 
@@ -133,7 +123,7 @@ pub struct Authority {
     pub stake: Stake,
     /// The network addresses of the primary.
     pub primary: PrimaryAddresses,
-    /// Map of workers' id and their network addresses.
+    /// Legacy address map: only entry 0's client-ingress address is used.
     pub workers: HashMap<WorkerId, WorkerAddresses>,
 }
 

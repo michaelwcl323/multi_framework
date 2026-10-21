@@ -15,6 +15,10 @@ class ParseError(Exception):
 
 class LogParser:
     def __init__(self, clients, primaries, workers, faults=0):
+        self.direct_batches = any('Direct batch proposals enabled' in log for log in primaries)
+        self.integrated = self.direct_batches or not workers or any('Integrated batch service' in log for log in primaries)
+        if self.integrated:
+            workers = primaries
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
@@ -23,7 +27,7 @@ class LogParser:
         self.faults = faults
         if isinstance(faults, int):
             self.committee_size = len(primaries) + int(faults)
-            self.workers =  len(workers) // len(primaries)
+            self.workers = 0 if self.integrated else len(workers) // len(primaries)
         else:
             self.committee_size = '?'
             self.workers = '?'
@@ -107,12 +111,10 @@ class LogParser:
         commits = self._merge_results([tmp])
 
         configs = {
-            'header_size': int(
-                search(r'Header size .* (\d+)', log).group(1)
-            ),
-            'max_header_delay': int(
-                search(r'Max header delay .* (\d+)', log).group(1)
-            ),
+            'header_size': int(search(r'Header size .* (\d+)', log).group(1))
+                if search(r'Header size .* (\d+)', log) else 0,
+            'max_header_delay': int(search(r'Max header delay .* (\d+)', log).group(1))
+                if search(r'Max header delay .* (\d+)', log) else 0,
             'gc_depth': int(
                 search(r'Garbage collection depth .* (\d+)', log).group(1)
             ),
@@ -201,6 +203,20 @@ class LogParser:
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
 
+        topology = (
+            ' Node processes per authority: 1 (direct batch proposals)\n'
+            if self.direct_batches else
+            ' Node processes per authority: 1 (integrated batching)\n'
+            if self.integrated else
+            f' Worker(s) per node: {self.workers} worker(s)\n'
+            f' Collocate primary and workers: {self.collocate}\n'
+        )
+
+        header_config = '' if self.direct_batches else (
+            f' Header size: {header_size:,} B\n'
+            f' Max header delay: {max_header_delay:,} ms\n'
+        )
+
         return (
             '\n'
             '-----------------------------------------\n'
@@ -209,14 +225,12 @@ class LogParser:
             ' + CONFIG:\n'
             f' Faults: {self.faults} node(s)\n'
             f' Committee size: {self.committee_size} node(s)\n'
-            f' Worker(s) per node: {self.workers} worker(s)\n'
-            f' Collocate primary and workers: {self.collocate}\n'
+            f'{topology}'
             f' Input rate: {sum(self.rate):,} tx/s\n'
             f' Transaction size: {self.size[0]:,} B\n'
             f' Execution time: {round(duration):,} s\n'
             '\n'
-            f' Header size: {header_size:,} B\n'
-            f' Max header delay: {max_header_delay:,} ms\n'
+            f'{header_config}'
             f' GC depth: {gc_depth:,} round(s)\n'
             f' Sync retry delay: {sync_retry_delay:,} ms\n'
             f' Sync retry nodes: {sync_retry_nodes:,} node(s)\n'

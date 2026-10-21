@@ -1,3 +1,22 @@
+# Direct-batch benchmarks (ISS branch)
+
+Run `fab local` from this directory. Each authority starts one `node ... primary`
+process that batches raw client transactions directly into complete DAG batch
+proposals. There is no preliminary payload broadcast or worker process.
+Use `workers: 1` and `collocate: True` in local, AWS, and CloudLab parameters.
+
+Only `batch_size` and `max_batch_delay` control batching. `header_size` and
+`max_header_delay` are obsolete and are not used. Peer traffic uses the primary
+port; the legacy worker address entry supplies only the client-ingress port.
+
+Batch sizes, samples, proposal IDs and commits are in `logs/primary-*.log`.
+Remote downloaders collect primary/client logs. Local tmux sessions use the
+`iss-local` socket. The parser still accepts historical worker-log datasets.
+
+The upstream documentation below describes the original architecture and
+historical results. Its header configuration and separate-worker deployment
+instructions do not apply to this branch.
+
 # Running Benchmarks
 This document explains how to benchmark the codebase and read benchmarks' results. It also provides a step-by-step tutorial to run benchmarks on [Amazon Web Services (AWS)](https://aws.amazon.com) accross multiple data centers (WAN).
 

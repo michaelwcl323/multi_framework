@@ -2,7 +2,7 @@
 use super::*;
 use config::{Authority, PrimaryAddresses};
 use crypto::{generate_keypair, SecretKey};
-use primary::Header;
+use primary::Batch;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use std::collections::{BTreeSet, VecDeque};
@@ -43,11 +43,11 @@ fn mock_certificate(
     parents: BTreeSet<Digest>,
 ) -> (Digest, Certificate) {
     let certificate = Certificate {
-        header: Header {
+        batch: Batch {
             author: origin,
             round,
             parents,
-            ..Header::default()
+            ..Batch::default()
         },
         ..Certificate::default()
     };

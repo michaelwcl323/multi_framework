@@ -1,12 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, Header, Vote};
+use crate::messages::{Batch, Certificate, Vote};
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
 use std::collections::HashSet;
 
-/// Aggregates votes for a particular header into a certificate.
+/// Aggregates votes for a particular batch into a certificate.
 pub struct VotesAggregator {
     weight: Stake,
     votes: Vec<(PublicKey, Signature)>,
@@ -26,7 +26,7 @@ impl VotesAggregator {
         &mut self,
         vote: Vote,
         committee: &Committee,
-        header: &Header,
+        batch: &Batch,
     ) -> DagResult<Option<Certificate>> {
         let author = vote.author;
 
@@ -38,7 +38,7 @@ impl VotesAggregator {
         if self.weight >= committee.quorum_threshold() {
             self.weight = 0; // Ensures quorum is only reached once.
             return Ok(Some(Certificate {
-                header: header.clone(),
+                batch: batch.clone(),
                 votes: self.votes.clone(),
             }));
         }

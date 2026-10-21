@@ -10,25 +10,25 @@ async fn propose_empty() {
 
     let (_tx_parents, rx_parents) = channel(1);
     let (_tx_our_digests, rx_our_digests) = channel(1);
-    let (tx_headers, mut rx_headers) = channel(1);
+    let (tx_batches, mut rx_batches) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
         name,
         &committee(),
         signature_service,
-        /* header_size */ 1_000,
-        /* max_header_delay */ 20,
+        /* batch_size */ 1_000,
+        /* max_batch_delay */ 20,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
-        /* tx_core */ tx_headers,
+        /* tx_core */ tx_batches,
     );
 
-    // Ensure the proposer makes a correct empty header.
-    let header = rx_headers.recv().await.unwrap();
-    assert_eq!(header.round, 1);
-    assert!(header.payload.is_empty());
-    assert!(header.verify(&committee()).is_ok());
+    // Ensure the proposer makes a correct empty batch.
+    let batch = rx_batches.recv().await.unwrap();
+    assert_eq!(batch.round, 1);
+    assert!(batch.transactions.is_empty());
+    assert!(batch.verify(&committee()).is_ok());
 }
 
 #[tokio::test]
@@ -38,31 +38,28 @@ async fn propose_payload() {
 
     let (_tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
-    let (tx_headers, mut rx_headers) = channel(1);
+    let (tx_batches, mut rx_batches) = channel(1);
 
     // Spawn the proposer.
     Proposer::spawn(
         name,
         &committee(),
         signature_service,
-        /* header_size */ 32,
-        /* max_header_delay */ 1_000_000, // Ensure it is not triggered.
+        /* batch_size */ 32,
+        /* max_batch_delay */ 1_000_000, // Ensure it is not triggered.
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
-        /* tx_core */ tx_headers,
+        /* tx_core */ tx_batches,
     );
 
-    // Send enough digests for the header payload.
-    let digest = Digest(name.0);
-    let worker_id = 0;
-    tx_our_digests
-        .send((digest.clone(), worker_id))
+    // Client transactions are proposed directly, with no availability ACK input.
+    let transaction = vec![7_u8; 32];
+    tx_our_digests.send(transaction.clone()).await.unwrap();
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(1), rx_batches.recv())
         .await
+        .unwrap()
         .unwrap();
-
-    // Ensure the proposer makes a correct header from the provided payload.
-    let header = rx_headers.recv().await.unwrap();
-    assert_eq!(header.round, 1);
-    assert_eq!(header.payload.get(&digest), Some(&worker_id));
-    assert!(header.verify(&committee()).is_ok());
+    assert_eq!(batch.round, 1);
+    assert_eq!(batch.transactions, vec![transaction]);
+    assert!(batch.verify(&committee()).is_ok());
 }

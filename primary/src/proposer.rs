@@ -1,12 +1,14 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, Header};
+use crate::messages::{Batch, Certificate, Transaction};
 use crate::primary::Round;
-use config::{Committee, WorkerId};
+use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
+#[cfg(feature = "benchmark")]
+use std::convert::TryInto;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -14,31 +16,17 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
 
-/// The proposer creates new headers and send them to the core for broadcasting and further processing.
 pub struct Proposer {
-    /// The public key of this primary.
     name: PublicKey,
-    /// Service to sign headers.
     signature_service: SignatureService,
-    /// The size of the headers' payload.
-    header_size: usize,
-    /// The maximum delay to wait for batches' digests.
-    max_header_delay: u64,
-
-    /// Receives the parents to include in the next header (along with their round number).
+    batch_size: usize,
+    max_batch_delay: u64,
     rx_core: Receiver<(Vec<Digest>, Round)>,
-    /// Receives the batches' digests from our workers.
-    rx_workers: Receiver<(Digest, WorkerId)>,
-    /// Sends newly created headers to the `Core`.
-    tx_core: Sender<Header>,
-
-    /// The current round of the dag.
+    rx_transactions: Receiver<Transaction>,
+    tx_core: Sender<Batch>,
     round: Round,
-    /// Holds the certificates' ids waiting to be included in the next header.
     last_parents: Vec<Digest>,
-    /// Holds the batches' digests waiting to be included in the next header.
-    digests: Vec<(Digest, WorkerId)>,
-    /// Keeps track of the size (in bytes) of batches' digests that we received so far.
+    transactions: Vec<Transaction>,
     payload_size: usize,
 }
 
@@ -48,29 +36,28 @@ impl Proposer {
         name: PublicKey,
         committee: &Committee,
         signature_service: SignatureService,
-        header_size: usize,
-        max_header_delay: u64,
+        batch_size: usize,
+        max_batch_delay: u64,
         rx_core: Receiver<(Vec<Digest>, Round)>,
-        rx_workers: Receiver<(Digest, WorkerId)>,
-        tx_core: Sender<Header>,
+        rx_transactions: Receiver<Transaction>,
+        tx_core: Sender<Batch>,
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
             .map(|x| x.digest())
             .collect();
-
         tokio::spawn(async move {
             Self {
                 name,
                 signature_service,
-                header_size,
-                max_header_delay,
+                batch_size,
+                max_batch_delay,
                 rx_core,
-                rx_workers,
+                rx_transactions,
                 tx_core,
                 round: 1,
                 last_parents: genesis,
-                digests: Vec::with_capacity(2 * header_size),
+                transactions: Vec::new(),
                 payload_size: 0,
             }
             .run()
@@ -78,77 +65,62 @@ impl Proposer {
         });
     }
 
-    async fn make_header(&mut self) {
-        // Make a new header.
-        let header = Header::new(
+    async fn make_batch(&mut self) {
+        let batch = Batch::new(
             self.name,
             self.round,
-            self.digests.drain(..).collect(),
+            self.transactions.drain(..).collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
         )
         .await;
-        debug!("Created {:?}", header);
-
+        debug!("Created {:?}", batch);
         #[cfg(feature = "benchmark")]
-        for digest in header.payload.keys() {
-            // NOTE: This log entry is used to compute performance.
-            info!("Created {} -> {:?}", header, digest);
+        if !batch.transactions.is_empty() {
+            // The batch ID identifies the complete signed proposal; no second payload ID exists.
+            info!("Batch {:?} contains {} B", batch.id, self.payload_size);
+            for tx in &batch.transactions {
+                if tx.len() > 8 && tx[0] == 0 {
+                    let id = u64::from_be_bytes(tx[1..9].try_into().unwrap());
+                    info!("Batch {:?} contains sample tx {}", batch.id, id);
+                }
+            }
+            info!("Created {} -> {:?}", batch, batch.id);
         }
-
-        // Send the new header to the `Core` that will broadcast and process it.
         self.tx_core
-            .send(header)
+            .send(batch)
             .await
-            .expect("Failed to send header");
+            .expect("Failed to send batch proposal");
     }
 
-    // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
-        debug!("Dag starting at round {}", self.round);
-
-        let timer = sleep(Duration::from_millis(self.max_header_delay));
+        let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
-
         loop {
-            // Check if we can propose a new header. We propose a new header when one of the following
-            // conditions is met:
-            // 1. We have a quorum of certificates from the previous round and enough batches' digests;
-            // 2. We have a quorum of certificates from the previous round and the specified maximum
-            // inter-header delay has passed.
-            let enough_parents = !self.last_parents.is_empty();
-            let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
-            if (timer_expired || enough_digests) && enough_parents {
-                // Make a new header.
-                self.make_header().await;
+            if !self.last_parents.is_empty()
+                && (timer_expired || self.payload_size >= self.batch_size)
+            {
+                // Empty proposals permit DAG progress when client traffic is idle.
+                self.make_batch().await;
                 self.payload_size = 0;
-
-                // Reschedule the timer.
-                let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
-                timer.as_mut().reset(deadline);
+                timer
+                    .as_mut()
+                    .reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
             }
-
             tokio::select! {
                 Some((parents, round)) = self.rx_core.recv() => {
-                    if round < self.round {
-                        continue;
+                    if round >= self.round {
+                        self.round = round + 1;
+                        self.last_parents = parents;
                     }
-
-                    // Advance to the next round.
-                    self.round = round + 1;
-                    debug!("Dag moved to round {}", self.round);
-
-                    // Signal that we have enough parent certificates to propose a new header.
-                    self.last_parents = parents;
                 }
-                Some((digest, worker_id)) = self.rx_workers.recv() => {
-                    self.payload_size += digest.size();
-                    self.digests.push((digest, worker_id));
+                // Stop reading once a batch is full until parent certificates let us propose it.
+                Some(transaction) = self.rx_transactions.recv(), if self.payload_size < self.batch_size => {
+                    self.payload_size += transaction.len();
+                    self.transactions.push(transaction);
                 }
-                () = &mut timer => {
-                    // Nothing to do.
-                }
+                () = &mut timer, if !timer.is_elapsed() => {}
             }
         }
     }

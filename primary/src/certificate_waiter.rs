@@ -37,7 +37,7 @@ impl CertificateWaiter {
     }
 
     /// Helper function. It waits for particular data to become available in the storage
-    /// and then delivers the specified header.
+    /// and then delivers the specified batch.
     async fn waiter(
         mut missing: Vec<(Vec<u8>, Store)>,
         deliver: Certificate,
@@ -62,7 +62,7 @@ impl CertificateWaiter {
                     // Add the certificate to the waiter pool. The waiter will return it to us
                     // when all its parents are in the store.
                     let wait_for = certificate
-                        .header
+                        .batch
                         .parents
                         .iter()
                         .cloned()

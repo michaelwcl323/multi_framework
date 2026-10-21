@@ -60,6 +60,9 @@ class Committee:
         assert len({len(x) for x in addresses.values()}) == 1
         assert isinstance(base_port, int) and base_port > 1024
 
+        if any(len(hosts) != 2 or hosts[0] != hosts[1] for hosts in addresses.values()):
+            raise ConfigError('Each integrated node requires one batch endpoint on its primary host')
+
         port = base_port
         self.json = {'authorities': OrderedDict()}
         for name, hosts in addresses.items():
@@ -165,8 +168,6 @@ class NodeParameters:
     def __init__(self, json):
         inputs = []
         try:
-            inputs += [json['header_size']]
-            inputs += [json['max_header_delay']]
             inputs += [json['gc_depth']]
             inputs += [json['sync_retry_delay']]
             inputs += [json['sync_retry_nodes']]
@@ -221,6 +222,9 @@ class BenchParameters:
 
         except ValueError:
             raise ConfigError('Invalid parameters type')
+
+        if self.workers != 1 or not self.collocate:
+            raise ConfigError('Integrated nodes require workers=1 and collocate=True')
 
         if min(self.nodes) <= self.faults:
             raise ConfigError('There should be more nodes than faults')

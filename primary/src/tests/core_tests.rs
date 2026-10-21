@@ -1,41 +1,41 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{
-    certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
+    batch, batches, certificate, committee, committee_with_base_port, keys, listener, votes,
 };
 use futures::future::try_join_all;
 use std::fs;
 use tokio::sync::mpsc::channel;
 
 #[tokio::test]
-async fn process_header() {
+async fn process_batch() {
     let mut keys = keys();
-    let _ = keys.pop().unwrap(); // Skip the header' author.
+    let _ = keys.pop().unwrap(); // Skip the batch' author.
     let (name, secret) = keys.pop().unwrap();
     let mut signature_service = SignatureService::new(secret);
 
     let committee = committee_with_base_port(13_000);
 
-    let (tx_sync_headers, _rx_sync_headers) = channel(1);
+    let (tx_sync_batches, _rx_sync_batches) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_batches_loopback, rx_batches_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (_tx_batches, rx_batches) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
-    let path = ".db_test_process_header";
+    let path = ".db_test_process_batch";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
     // Make the vote we expect to receive.
-    let expected = Vote::new(&header(), &name, &mut signature_service).await;
+    let expected = Vote::new(&batch(), &name, &mut signature_service).await;
 
     // Spawn a listener to receive the vote.
     let address = committee
-        .primary(&header().author)
+        .primary(&batch().author)
         .unwrap()
         .primary_to_primary;
     let handle = listener(address);
@@ -45,7 +45,7 @@ async fn process_header() {
         name,
         &committee,
         store.clone(),
-        /* tx_header_waiter */ tx_sync_headers,
+        /* tx_batch_waiter */ tx_sync_batches,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
@@ -59,16 +59,16 @@ async fn process_header() {
         /* consensus_round */ Arc::new(AtomicU64::new(0)),
         /* gc_depth */ 50,
         /* rx_primaries */ rx_primary_messages,
-        /* rx_header_waiter */ rx_headers_loopback,
+        /* rx_batch_waiter */ rx_batches_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
-        /* rx_proposer */ rx_headers,
+        /* rx_proposer */ rx_batches,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
 
-    // Send a header to the core.
+    // Send a batch to the core.
     tx_primary_messages
-        .send(PrimaryMessage::Header(header()))
+        .send(PrimaryMessage::Batch(batch()))
         .await
         .unwrap();
 
@@ -79,31 +79,31 @@ async fn process_header() {
         x => panic!("Unexpected message: {:?}", x),
     }
 
-    // Ensure the header is correctly stored.
+    // Ensure the batch is correctly stored.
     let stored = store
-        .read(header().id.to_vec())
+        .read(batch().id.to_vec())
         .await
         .unwrap()
         .map(|x| bincode::deserialize(&x).unwrap());
-    assert_eq!(stored, Some(header()));
+    assert_eq!(stored, Some(batch()));
 }
 
 #[tokio::test]
-async fn process_header_missing_parent() {
+async fn process_batch_missing_parent() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
 
-    let (tx_sync_headers, _rx_sync_headers) = channel(1);
+    let (tx_sync_batches, mut rx_sync_batches) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_batches_loopback, rx_batches_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (_tx_batches, rx_batches) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
-    let path = ".db_test_process_header_missing_parent";
+    let path = ".db_test_process_batch_missing_parent";
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
@@ -112,7 +112,7 @@ async fn process_header_missing_parent() {
         name,
         &committee(),
         store.clone(),
-        /* tx_header_waiter */ tx_sync_headers,
+        /* tx_batch_waiter */ tx_sync_batches,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
@@ -126,85 +126,38 @@ async fn process_header_missing_parent() {
         /* consensus_round */ Arc::new(AtomicU64::new(0)),
         /* gc_depth */ 50,
         /* rx_primaries */ rx_primary_messages,
-        /* rx_header_waiter */ rx_headers_loopback,
+        /* rx_batch_waiter */ rx_batches_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
-        /* rx_proposer */ rx_headers,
+        /* rx_proposer */ rx_batches,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
 
-    // Send a header to the core.
-    let header = Header {
+    // Send a batch to the core.
+    let mut batch = Batch {
         parents: [Digest::default()].iter().cloned().collect(),
-        ..header()
+        ..batch()
     };
-    let id = header.id.clone();
+    batch.id = batch.digest();
+    batch.signature = crypto::Signature::new(&batch.id, &keys().pop().unwrap().1);
+    let id = batch.id.clone();
     tx_primary_messages
-        .send(PrimaryMessage::Header(header))
+        .send(PrimaryMessage::Batch(batch))
         .await
         .unwrap();
 
-    // Ensure the header is not stored.
-    assert!(store.read(id.to_vec()).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn process_header_missing_payload() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
-
-    let (tx_sync_headers, _rx_sync_headers) = channel(1);
-    let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
-    let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
-    let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, _rx_consensus) = channel(1);
-    let (tx_parents, _rx_parents) = channel(1);
-
-    // Create a new test store.
-    let path = ".db_test_process_header_missing_payload";
-    let _ = fs::remove_dir_all(path);
-    let mut store = Store::new(path).unwrap();
-
-    // Make a synchronizer for the core.
-    let synchronizer = Synchronizer::new(
-        name,
-        &committee(),
-        store.clone(),
-        /* tx_header_waiter */ tx_sync_headers,
-        /* tx_certificate_waiter */ tx_sync_certificates,
-    );
-
-    // Spawn the core.
-    Core::spawn(
-        name,
-        committee(),
-        store.clone(),
-        synchronizer,
-        signature_service,
-        /* consensus_round */ Arc::new(AtomicU64::new(0)),
-        /* gc_depth */ 50,
-        /* rx_primaries */ rx_primary_messages,
-        /* rx_header_waiter */ rx_headers_loopback,
-        /* rx_certificate_waiter */ rx_certificates_loopback,
-        /* rx_proposer */ rx_headers,
-        tx_consensus,
-        /* tx_proposer */ tx_parents,
-    );
-
-    // Send a header to the core.
-    let header = Header {
-        payload: [(Digest::default(), 0)].iter().cloned().collect(),
-        ..header()
-    };
-    let id = header.id.clone();
-    tx_primary_messages
-        .send(PrimaryMessage::Header(header))
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx_sync_batches.recv())
         .await
+        .unwrap()
         .unwrap();
+    match request {
+        crate::batch_waiter::WaiterMessage::SyncParents(missing, proposal) => {
+            assert_eq!(missing, vec![Digest::default()]);
+            assert!(!proposal.transactions.is_empty());
+        }
+    }
+    // A valid signed proposal waits for its missing parents before voting.
 
-    // Ensure the header is not stored.
     assert!(store.read(id.to_vec()).await.unwrap().is_none());
 }
 
@@ -215,12 +168,12 @@ async fn process_votes() {
 
     let committee = committee_with_base_port(13_100);
 
-    let (tx_sync_headers, _rx_sync_headers) = channel(1);
+    let (tx_sync_batches, _rx_sync_batches) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_batches_loopback, rx_batches_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (_tx_batches, rx_batches) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
@@ -234,7 +187,7 @@ async fn process_votes() {
         name,
         &committee,
         store.clone(),
-        /* tx_header_waiter */ tx_sync_headers,
+        /* tx_batch_waiter */ tx_sync_batches,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
@@ -248,15 +201,15 @@ async fn process_votes() {
         /* consensus_round */ Arc::new(AtomicU64::new(0)),
         /* gc_depth */ 50,
         /* rx_primaries */ rx_primary_messages,
-        /* rx_header_waiter */ rx_headers_loopback,
+        /* rx_batch_waiter */ rx_batches_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
-        /* rx_proposer */ rx_headers,
+        /* rx_proposer */ rx_batches,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
 
     // Make the certificate we expect to receive.
-    let expected = certificate(&Header::default());
+    let expected = certificate(&Batch::default());
 
     // Spawn all listeners to receive our newly formed certificate.
     let handles: Vec<_> = committee
@@ -266,7 +219,7 @@ async fn process_votes() {
         .collect();
 
     // Send a votes to the core.
-    for vote in votes(&Header::default()) {
+    for vote in votes(&Batch::default()) {
         tx_primary_messages
             .send(PrimaryMessage::Vote(vote))
             .await
@@ -287,12 +240,12 @@ async fn process_certificates() {
     let (name, secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(secret);
 
-    let (tx_sync_headers, _rx_sync_headers) = channel(1);
+    let (tx_sync_batches, _rx_sync_batches) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
-    let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
+    let (_tx_batches_loopback, rx_batches_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (_tx_batches, rx_batches) = channel(1);
     let (tx_consensus, mut rx_consensus) = channel(3);
     let (tx_parents, mut rx_parents) = channel(1);
 
@@ -306,7 +259,7 @@ async fn process_certificates() {
         name,
         &committee(),
         store.clone(),
-        /* tx_header_waiter */ tx_sync_headers,
+        /* tx_batch_waiter */ tx_sync_batches,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
@@ -320,18 +273,18 @@ async fn process_certificates() {
         /* consensus_round */ Arc::new(AtomicU64::new(0)),
         /* gc_depth */ 50,
         /* rx_primaries */ rx_primary_messages,
-        /* rx_header_waiter */ rx_headers_loopback,
+        /* rx_batch_waiter */ rx_batches_loopback,
         /* rx_certificate_waiter */ rx_certificates_loopback,
-        /* rx_proposer */ rx_headers,
+        /* rx_proposer */ rx_batches,
         tx_consensus,
         /* tx_proposer */ tx_parents,
     );
 
     // Send enough certificates to the core.
-    let certificates: Vec<_> = headers()
+    let certificates: Vec<_> = batches()
         .iter()
         .take(3)
-        .map(|header| certificate(header))
+        .map(|batch| certificate(batch))
         .collect();
 
     for x in certificates.clone() {

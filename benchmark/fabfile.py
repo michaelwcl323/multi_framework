@@ -40,8 +40,6 @@ def local(ctx, debug=False):
         'duration': 20,
     }
     node_params = {
-        'header_size': 1000,  # bytes
-        'max_header_delay': 200,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 1000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
@@ -144,8 +142,6 @@ def remote(ctx, debug=False):
         'runs': 2,
     }
     node_params = {
-        'header_size': 1_000,  # bytes
-        'max_header_delay': 200,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 10_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
@@ -241,8 +237,6 @@ def cloudlab_remote(ctx, debug=False):
         'runs': 1,
     }
     node_params = {
-        'header_size': 1_000,  # bytes
-        'max_header_delay': 200,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 1000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
