@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Position, Sequence};
+use crate::messages::{Instance, Position, Sequence};
 use crypto::{CryptoError, PublicKey};
 use store::StoreError;
 use thiserror::Error;
@@ -46,6 +46,13 @@ pub enum PbftError {
     MismatchedCommit,
     #[error("Unsupported protocol position {0:?}")]
     UnsupportedPosition(Position),
+    #[error("Unknown PBFT instance {0}")]
+    UnknownInstance(Instance),
+    #[error("Message targets instance {received}, expected {expected}")]
+    WrongInstance {
+        expected: Instance,
+        received: Instance,
+    },
     #[error("Sequence {0} is beyond the receive window")]
     OutsideWindow(Sequence),
     #[error("Conflicting proposal at sequence {0}")]

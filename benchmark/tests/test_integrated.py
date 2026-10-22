@@ -131,6 +131,23 @@ class IntegratedBenchTests(unittest.TestCase):
             self.assertAlmostEqual(parser._end_to_end_latency(), 0.475, places=5)
             self.assertIn('1 (single-instance PBFT)', parser.result())
             self.assertNotIn('Header size:', parser.result())
+            # Each MultiBFT instance has its own sequence 1; proposal IDs retain
+            # their instance identity even when local sequence numbers coincide.
+            first = leader.replace('Single-instance PBFT enabled:', 'MultiBFT enabled:')
+            second = common.replace('Single-instance PBFT enabled:', 'MultiBFT enabled:')
+            second += ''.join([
+                line('00.250', 'Batch xyz= contains 512 B'),
+                line('00.250', 'Created B1(other-key) -> xyz='),
+                line('00.650', 'Committed B1(other-key) -> xyz= (instance 1)'),
+            ])
+            Path(directory, 'primary-0.log').write_text(first)
+            Path(directory, 'primary-1.log').write_text(second)
+            parser = LogParser.process(directory)
+            self.assertTrue(parser.multibft)
+            self.assertEqual(parser.sizes, {'abc=': 1024, 'xyz=': 512})
+            self.assertEqual(len(parser.proposals), 3)
+            self.assertEqual(len(parser.commits), 2)
+            self.assertIn('1 (MultiBFT)', parser.result())
 
 
 if __name__ == '__main__':

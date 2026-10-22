@@ -1,5 +1,5 @@
 use super::*;
-use crate::common::{commits, committee, keys, prepares, proposal};
+use crate::common::{commits, committee, keys, prepares, proposal, proposal_for};
 use crate::messages::Position;
 use crypto::Signature;
 
@@ -33,7 +33,7 @@ fn accept(state: &mut Pbft, proposal: &PrePrepare) {
 
 #[test]
 fn duplicate_messages_do_not_add_weight_or_repeat_actions() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let pp = proposal(1, vec![vec![1]]);
     accept(&mut state, &pp);
     assert!(state
@@ -96,7 +96,7 @@ fn duplicate_messages_do_not_add_weight_or_repeat_actions() {
 
 #[test]
 fn early_prepare_and_commit_quorums_wait_for_the_proposal() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let pp = proposal(1, vec![vec![1]]);
     for commit in commits(&pp).into_iter().take(3) {
         assert!(state
@@ -116,7 +116,7 @@ fn early_prepare_and_commit_quorums_wait_for_the_proposal() {
 
 #[test]
 fn commit_quorum_cannot_bypass_local_prepared_state() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let pp = proposal(1, vec![]);
     accept(&mut state, &pp);
     for commit in commits(&pp).into_iter().take(3) {
@@ -140,7 +140,7 @@ fn commit_quorum_cannot_bypass_local_prepared_state() {
 
 #[test]
 fn conflicting_proposal_is_rejected_without_replacing_accepted_value() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let original = proposal(1, vec![vec![1]]);
     let conflict = proposal(1, vec![vec![2]]);
     accept(&mut state, &original);
@@ -167,7 +167,7 @@ fn conflicting_proposal_is_rejected_without_replacing_accepted_value() {
 
 #[test]
 fn equivocation_is_bounded_and_conflicting_digests_do_not_mix() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let pp = proposal(1, vec![vec![1]]);
     let other = proposal(1, vec![vec![2]]);
     accept(&mut state, &pp);
@@ -227,7 +227,7 @@ fn quorum_uses_stake_and_not_number_of_messages() {
     let voters = keys();
     committee.authorities.get_mut(&voters[0].0).unwrap().stake = 4;
     assert_eq!(committee.quorum_threshold(), 5);
-    let mut state = Pbft::new(committee);
+    let mut state = Pbft::new(committee, 0);
     let pp = proposal(1, vec![]);
     accept(&mut state, &pp);
     let prepares = prepares(&pp);
@@ -260,7 +260,7 @@ fn quorum_uses_stake_and_not_number_of_messages() {
 
 #[test]
 fn votes_from_other_slots_do_not_count_and_holes_hold_the_watermark() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let first = proposal(1, vec![]);
     let second = proposal(2, vec![]);
     accept(&mut state, &first);
@@ -291,7 +291,7 @@ fn votes_from_other_slots_do_not_count_and_holes_hold_the_watermark() {
 
 #[test]
 fn invalid_senders_signatures_contexts_and_future_slots_do_not_allocate_state() {
-    let mut state = Pbft::new(committee());
+    let mut state = Pbft::new(committee(), 0);
     let pp = proposal(1, vec![]);
     let mut forged = prepares(&pp)[0].clone();
     forged.signature = Signature::default();
@@ -325,7 +325,7 @@ fn invalid_senders_signatures_contexts_and_future_slots_do_not_allocate_state() 
         invalid.position = position;
         assert!(matches!(
             state.process(PbftMessage::PrePrepare(invalid)),
-            Err(PbftError::UnsupportedPosition(_))
+            Err(PbftError::UnsupportedPosition(_)) | Err(PbftError::WrongInstance { .. })
         ));
     }
     let future = proposal(SEQUENCE_WINDOW + 1, vec![]);
@@ -356,7 +356,7 @@ fn all_phase_interleavings_with_duplicates_decide_the_same_batch_once() {
         let mut messages = messages.clone();
         messages.extend(messages.clone());
         messages.shuffle(&mut StdRng::seed_from_u64(seed));
-        let mut state = Pbft::new(committee());
+        let mut state = Pbft::new(committee(), 0);
         let mut total = (0, 0, 0);
         for message in messages {
             let actions = state.process(message).unwrap();
@@ -373,4 +373,91 @@ fn all_phase_interleavings_with_duplicates_decide_the_same_batch_once() {
         }
         assert_eq!(total, (1, 1, 1));
     }
+}
+
+#[test]
+fn instances_with_the_same_sequence_keep_quorums_and_progress_separate() {
+    let mut first = Pbft::new(committee(), 0);
+    let mut second = Pbft::new(committee(), 1);
+    let a = proposal_for(0, 1, vec![vec![1]]);
+    let b = proposal_for(1, 1, vec![vec![2]]);
+    accept(&mut first, &a);
+    accept(&mut second, &b);
+    let a_prepares = prepares(&a);
+    let b_prepares = prepares(&b);
+    for i in 0..2 {
+        assert!(first
+            .process(PbftMessage::Prepare(a_prepares[i].clone()))
+            .unwrap()
+            .is_empty());
+        assert!(second
+            .process(PbftMessage::Prepare(b_prepares[i].clone()))
+            .unwrap()
+            .is_empty());
+    }
+    for vote in prepares(&a) {
+        assert!(matches!(
+            second.process(PbftMessage::Prepare(vote)),
+            Err(PbftError::WrongInstance {
+                expected: 1,
+                received: 0
+            })
+        ));
+    }
+    assert_eq!(
+        counts(
+            &first
+                .process(PbftMessage::Prepare(a_prepares[2].clone()))
+                .unwrap()
+        ),
+        (0, 1, 0)
+    );
+    for vote in commits(&a).into_iter().take(3) {
+        first.process(PbftMessage::Commit(vote)).unwrap();
+    }
+    assert_eq!(first.low_watermark, 2);
+    assert_eq!(second.low_watermark, 1);
+    assert!(!second.slots[&1].commit_sent);
+    // Completing instance 0 does not garbage collect instance 1's early votes.
+    assert_eq!(
+        counts(
+            &second
+                .process(PbftMessage::Prepare(b_prepares[2].clone()))
+                .unwrap()
+        ),
+        (0, 1, 0)
+    );
+    let mut decided = 0;
+    for vote in commits(&b).into_iter().take(3) {
+        decided += counts(&second.process(PbftMessage::Commit(vote)).unwrap()).2;
+    }
+    assert_eq!(decided, 1);
+    assert_eq!(second.low_watermark, 2);
+}
+
+#[test]
+fn rewriting_a_signed_vote_to_another_valid_instance_does_not_make_it_count() {
+    let a = proposal_for(0, 1, vec![vec![1]]);
+    let b = proposal_for(1, 1, vec![vec![1]]);
+    let mut second = Pbft::new(committee(), 1);
+    let mut prepare = prepares(&a)[0].clone();
+    prepare.position = b.position;
+    prepare.proposal = b.digest();
+    assert!(matches!(
+        second.process(PbftMessage::Prepare(prepare)),
+        Err(PbftError::InvalidSignature(_))
+    ));
+    let mut commit = commits(&a)[0].clone();
+    commit.position = b.position;
+    commit.proposal = b.digest();
+    assert!(matches!(
+        second.process(PbftMessage::Commit(commit)),
+        Err(PbftError::InvalidSignature(_))
+    ));
+    assert!(matches!(
+        second.process(PbftMessage::PrePrepare(a)),
+        Err(PbftError::WrongInstance { .. })
+    ));
+    assert!(second.slots.is_empty());
+    accept(&mut second, &b);
 }

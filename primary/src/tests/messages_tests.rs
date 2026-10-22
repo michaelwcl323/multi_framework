@@ -1,5 +1,5 @@
 use super::*;
-use crate::common::{commits, committee, decision, prepares, proposal};
+use crate::common::{commits, committee, decision, prepares, proposal, proposal_for};
 
 #[test]
 fn signed_proposal_and_commit_proof_carry_full_transactions() {
@@ -90,5 +90,52 @@ fn commit_proof_rejects_duplicates_missing_quorum_and_mismatched_slots_or_digest
     assert!(matches!(
         invalid.verify(&committee()),
         Err(PbftError::MismatchedCommit)
+    ));
+}
+
+#[test]
+fn each_instance_has_its_own_leader_and_commit_proof() {
+    let committee = committee();
+    let owners: Vec<_> = committee.authorities.keys().copied().collect();
+    for (instance, owner) in owners.iter().enumerate() {
+        assert_eq!(leader(&committee, instance as u64), Some(*owner));
+        let proposal = proposal_for(instance as u64, 1, vec![vec![7]]);
+        proposal.verify(&committee).unwrap();
+        CommittedBatch {
+            commits: commits(&proposal),
+            proposal,
+        }
+        .verify(&committee)
+        .unwrap();
+    }
+    assert!(leader(&committee, owners.len() as u64).is_none());
+    assert!(leader(&committee, u64::MAX).is_none());
+    let first = proposal_for(0, 1, vec![vec![7]]);
+    let second = proposal_for(1, 1, vec![vec![7]]);
+    let mut wrong_leader = first.clone();
+    wrong_leader.position.instance = 1;
+    assert!(matches!(
+        wrong_leader.verify(&committee),
+        Err(PbftError::UnexpectedLeader(_))
+    ));
+    assert!(matches!(
+        CommittedBatch {
+            proposal: second,
+            commits: commits(&first)
+        }
+        .verify(&committee),
+        Err(PbftError::MismatchedCommit)
+    ));
+    let mut unknown = first.clone();
+    unknown.position.instance = u64::MAX;
+    assert!(matches!(
+        unknown.verify(&committee),
+        Err(PbftError::UnknownInstance(_))
+    ));
+    let mut vote = prepares(&first)[0].clone();
+    vote.position.instance = u64::MAX;
+    assert!(matches!(
+        vote.verify(&committee),
+        Err(PbftError::UnknownInstance(_))
     ));
 }

@@ -70,13 +70,17 @@ pub fn committee_with_base_port(base: u16) -> Committee {
 }
 
 pub fn proposal(sequence: u64, transactions: Vec<Vec<u8>>) -> PrePrepare {
-    let author = leader(&committee());
+    proposal_for(0, sequence, transactions)
+}
+
+pub fn proposal_for(instance: u64, sequence: u64, transactions: Vec<Vec<u8>>) -> PrePrepare {
+    let author = leader(&committee(), instance).unwrap();
     let (_, secret) = keys()
         .into_iter()
         .find(|(name, _)| *name == author)
         .unwrap();
     let mut proposal = PrePrepare {
-        position: Position::new(sequence),
+        position: Position::for_instance(instance, sequence),
         batch: Batch::new(transactions),
         author,
         signature: Signature::default(),

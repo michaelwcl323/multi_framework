@@ -1,7 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{commits, committee_with_base_port, keys, prepares, proposal};
+use crate::primary::PrimaryMessage;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::SinkExt;
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use std::error::Error;
@@ -24,7 +26,7 @@ impl MessageHandler for Observer {
 #[tokio::test]
 async fn backup_broadcasts_prepare_and_commit_to_every_other_replica() {
     let committee = committee_with_base_port(17_000);
-    let leader = crate::leader(&committee);
+    let leader = crate::leader(&committee, 0).unwrap();
     let (name, secret) = keys()
         .into_iter()
         .find(|(name, _)| *name != leader)
@@ -44,6 +46,7 @@ async fn backup_broadcasts_prepare_and_commit_to_every_other_replica() {
     Core::spawn(
         name,
         committee.clone(),
+        0,
         store,
         SignatureService::new(secret),
         50,
@@ -51,6 +54,7 @@ async fn backup_broadcasts_prepare_and_commit_to_every_other_replica() {
         rx_proposer,
         tx_output,
         None,
+        Network::spawn(name, &committee),
     );
     let pp = proposal(1, vec![vec![7; 10]]);
     tx.send(PbftMessage::PrePrepare(pp.clone())).await.unwrap();

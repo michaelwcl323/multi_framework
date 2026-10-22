@@ -1,28 +1,26 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::core::Core;
-use crate::messages::{leader, CommittedBatch, PbftMessage, Transaction};
+use crate::messages::{CommittedBatch, PbftMessage, Transaction};
 use crate::proposer::Proposer;
+use crate::transport::Network;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters};
 use crypto::SignatureService;
 use futures::SinkExt as _;
-use log::info;
-use network::{CancelHandler, MessageHandler, Receiver as NetworkReceiver, ReliableSender, Writer};
+use log::{info, warn};
+use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
-use std::net::SocketAddr;
+use std::sync::Arc;
 use store::Store;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::time::{interval, Duration};
+use tokio::sync::mpsc::{channel, Sender};
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum PrimaryMessage {
     Pbft(PbftMessage),
-    Transaction(Transaction),
 }
 
 pub struct Primary;
@@ -42,12 +40,50 @@ impl Primary {
         assert!(parameters.batch_size > 0, "Batch size must be positive");
         let name = keypair.name;
         assert!(committee.stake(&name) > 0, "Node has no voting rights");
-        let is_leader = name == leader(&committee);
         let (tx_transactions, rx_transactions) = channel(CHANNEL_CAPACITY);
-        let (tx_messages, rx_messages) = channel(CHANNEL_CAPACITY);
-        let (tx_proposals, rx_proposals) = channel(CHANNEL_CAPACITY);
-        let (tx_committed, rx_committed) = channel(CHANNEL_CAPACITY);
+        let mut own_transactions = Some(rx_transactions);
+        let signatures = SignatureService::new(keypair.secret);
+        let network = Network::spawn(name, &committee);
+        let mut routes = Vec::with_capacity(committee.size());
+        let mut local_instance = None;
         parameters.log();
+
+        // Every replica runs every instance. Each replica leads exactly the
+        // instance corresponding to its position in sorted committee key order.
+        for (instance, owner) in committee.authorities.keys().enumerate() {
+            let instance = instance as u64;
+            let is_leader = name == *owner;
+            let (tx_messages, rx_messages) = channel(CHANNEL_CAPACITY);
+            let (tx_proposals, rx_proposals) = channel(CHANNEL_CAPACITY);
+            let (tx_committed, rx_committed) = channel(CHANNEL_CAPACITY);
+            routes.push(tx_messages);
+            Core::spawn(
+                name,
+                committee.clone(),
+                instance,
+                store.clone(),
+                signatures.clone(),
+                parameters.gc_depth,
+                rx_messages,
+                rx_proposals,
+                tx_consensus.clone(),
+                if is_leader { Some(tx_committed) } else { None },
+                network.clone(),
+            );
+            if is_leader {
+                local_instance = Some(instance);
+                Proposer::spawn(
+                    name,
+                    instance,
+                    signatures.clone(),
+                    parameters.batch_size,
+                    parameters.max_batch_delay,
+                    rx_committed,
+                    own_transactions.take().expect("Duplicate local leader"),
+                    tx_proposals,
+                );
+            }
+        }
 
         let mut address = committee
             .primary(&name)
@@ -57,12 +93,7 @@ impl Primary {
         NetworkReceiver::spawn(
             address,
             PrimaryReceiverHandler {
-                tx_messages,
-                tx_transactions: if is_leader {
-                    Some(tx_transactions.clone())
-                } else {
-                    None
-                },
+                routes: Arc::new(routes),
             },
         );
         let mut transactions = committee
@@ -71,69 +102,16 @@ impl Primary {
             .transactions;
         transactions.set_ip("0.0.0.0".parse().unwrap());
         NetworkReceiver::spawn(transactions, TransactionReceiver { tx_transactions });
-        let signatures = SignatureService::new(keypair.secret);
-        Core::spawn(
-            name,
-            committee.clone(),
-            store,
-            signatures.clone(),
-            parameters.gc_depth,
-            rx_messages,
-            rx_proposals,
-            tx_consensus,
-            if is_leader { Some(tx_committed) } else { None },
-        );
-        if is_leader {
-            Proposer::spawn(
-                name,
-                signatures,
-                parameters.batch_size,
-                parameters.max_batch_delay,
-                rx_committed,
-                rx_transactions,
-                tx_proposals,
-            );
-        } else {
-            // Preserve one client endpoint per node. Backups forward client input
-            // once to the fixed leader; PBFT messages always use the common port.
-            let address = committee
-                .primary(&leader(&committee))
-                .unwrap()
-                .primary_to_primary;
-            tokio::spawn(forward_transactions(rx_transactions, address));
-        }
         info!(
-            "Single-instance PBFT enabled: leader {}, epoch 0, instance 0, view 0",
-            leader(&committee)
+            "MultiBFT enabled: {} instances; local instance {}; epoch 0, view 0",
+            committee.size(),
+            local_instance.expect("Missing local instance")
         );
         info!(
             "Primary {} successfully booted on {}",
             name,
             committee.primary(&name).unwrap().primary_to_primary.ip()
         );
-    }
-}
-
-async fn forward_transactions(mut transactions: Receiver<Transaction>, address: SocketAddr) {
-    let mut network = ReliableSender::new();
-    let mut pending: HashMap<u64, CancelHandler> = HashMap::new();
-    let mut counter = 0;
-    let mut timer = interval(Duration::from_millis(50));
-    loop {
-        tokio::select! {
-            Some(transaction) = transactions.recv(), if pending.len() < CHANNEL_CAPACITY => {
-                let bytes = bincode::serialize(&PrimaryMessage::Transaction(transaction)).unwrap();
-                pending.insert(counter, network.send(address, Bytes::from(bytes)).await);
-                counter += 1;
-            }
-            _ = timer.tick() => {},
-        }
-        pending.retain(|_, handler| {
-            matches!(
-                handler.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            )
-        });
     }
 }
 
@@ -152,20 +130,18 @@ impl MessageHandler for TransactionReceiver {
 
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
-    tx_messages: Sender<PbftMessage>,
-    tx_transactions: Option<Sender<Transaction>>,
+    routes: Arc<Vec<Sender<PbftMessage>>>,
 }
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, bytes: Bytes) -> Result<(), Box<dyn Error>> {
-        match bincode::deserialize(&bytes)? {
-            PrimaryMessage::Pbft(message) => self.tx_messages.send(message).await?,
-            PrimaryMessage::Transaction(transaction) => {
-                if let Some(tx) = &self.tx_transactions {
-                    tx.send(transaction).await?;
-                }
-            }
+        let PrimaryMessage::Pbft(message) = bincode::deserialize(&bytes)?;
+        let instance = message.position().instance;
+        if instance < self.routes.len() as u64 {
+            self.routes[instance as usize].send(message).await?;
+        } else {
+            warn!("Ignoring message for unknown PBFT instance {}", instance);
         }
         // This ACK only acknowledges transport delivery, never a protocol vote.
         writer.send(Bytes::from_static(b"Ack")).await?;

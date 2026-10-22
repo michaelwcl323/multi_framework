@@ -1,13 +1,14 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{PbftError, PbftResult};
-use crate::messages::{Commit, CommittedBatch, PbftMessage, PrePrepare, Prepare, Sequence};
+use crate::messages::{
+    Commit, CommittedBatch, Instance, PbftMessage, PrePrepare, Prepare, Sequence,
+};
 use crate::pbft::{Action, Pbft};
-use crate::primary::PrimaryMessage;
-use bytes::Bytes;
+use crate::transport::Network;
 use config::Committee;
 use crypto::{Hash as _, PublicKey, SignatureService};
 use log::{debug, warn};
-use network::{CancelHandler, ReliableSender};
+use network::CancelHandler;
 use std::collections::{HashMap, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -19,7 +20,6 @@ mod tests;
 
 pub(crate) struct Core {
     name: PublicKey,
-    committee: Committee,
     store: Store,
     signatures: SignatureService,
     pbft: Pbft,
@@ -28,7 +28,7 @@ pub(crate) struct Core {
     rx_proposer: Receiver<PrePrepare>,
     tx_consensus: Sender<CommittedBatch>,
     tx_proposer: Option<Sender<Sequence>>,
-    network: ReliableSender,
+    network: Network,
     cancel_handlers: HashMap<Sequence, Vec<CancelHandler>>,
 }
 
@@ -37,6 +37,7 @@ impl Core {
     pub fn spawn(
         name: PublicKey,
         committee: Committee,
+        instance: Instance,
         store: Store,
         signatures: SignatureService,
         gc_depth: Sequence,
@@ -44,12 +45,12 @@ impl Core {
         rx_proposer: Receiver<PrePrepare>,
         tx_consensus: Sender<CommittedBatch>,
         tx_proposer: Option<Sender<Sequence>>,
+        network: Network,
     ) {
         tokio::spawn(async move {
             Self {
                 name,
-                pbft: Pbft::new(committee.clone()),
-                committee,
+                pbft: Pbft::new(committee, instance),
                 store,
                 signatures,
                 gc_depth,
@@ -57,7 +58,7 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
-                network: ReliableSender::new(),
+                network,
                 cancel_handlers: HashMap::new(),
             }
             .run()
@@ -76,15 +77,7 @@ impl Core {
 
     async fn broadcast(&mut self, message: PbftMessage) {
         let sequence = message.position().sequence;
-        let bytes = bincode::serialize(&PrimaryMessage::Pbft(message))
-            .expect("Failed to serialize PBFT message");
-        let addresses = self
-            .committee
-            .others_primaries(&self.name)
-            .iter()
-            .map(|(_, x)| x.primary_to_primary)
-            .collect();
-        let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+        let handlers = self.network.broadcast(message).await;
         self.cancel_handlers
             .entry(sequence)
             .or_default()
@@ -113,7 +106,7 @@ impl Core {
                     debug!("PBFT decided {}", decision.proposal);
                     let sequence = decision.proposal.position.sequence;
                     let mut key = b"pbft/committed/".to_vec();
-                    key.extend_from_slice(&sequence.to_le_bytes());
+                    key.extend_from_slice(&bincode::serialize(&decision.proposal.position)?);
                     self.persist(key, bincode::serialize(&decision)?).await?;
                     self.tx_consensus
                         .send(decision)

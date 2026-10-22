@@ -17,7 +17,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Benchmark client for single-instance PBFT.")
+        .about("Benchmark client for parallel PBFT instances.")
         .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
@@ -102,8 +102,7 @@ impl Client {
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
-        // Samples from different client endpoints may be batched by one leader.
-        // Keep their IDs distinct when logs are merged across nodes.
+        // Keep sample IDs distinct when logs are merged across instance leaders.
         let sample_namespace = u64::from(rand::random::<u32>()) << 32;
         let mut r = rand::thread_rng().gen();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());

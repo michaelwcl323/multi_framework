@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Batch, PrePrepare, Sequence, Transaction};
+use crate::messages::{Batch, Instance, Position, PrePrepare, Sequence, Transaction};
 use crypto::{Hash as _, PublicKey, SignatureService};
 use log::debug;
 #[cfg(feature = "benchmark")]
@@ -15,6 +15,7 @@ mod tests;
 
 pub(crate) struct Proposer {
     name: PublicKey,
+    instance: Instance,
     signatures: SignatureService,
     batch_size: usize,
     max_batch_delay: u64,
@@ -31,6 +32,7 @@ impl Proposer {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
+        instance: Instance,
         signatures: SignatureService,
         batch_size: usize,
         max_batch_delay: u64,
@@ -41,6 +43,7 @@ impl Proposer {
         tokio::spawn(async move {
             Self {
                 name,
+                instance,
                 signatures,
                 batch_size,
                 max_batch_delay,
@@ -59,7 +62,13 @@ impl Proposer {
 
     async fn make_proposal(&mut self) {
         let batch = Batch::new(self.transactions.drain(..).collect());
-        let proposal = PrePrepare::new(self.sequence, batch, self.name, &mut self.signatures).await;
+        let proposal = PrePrepare::new(
+            Position::for_instance(self.instance, self.sequence),
+            batch,
+            self.name,
+            &mut self.signatures,
+        )
+        .await;
         debug!("Created {} -> {:?}", proposal, proposal.digest());
         #[cfg(feature = "benchmark")]
         if !proposal.batch.transactions.is_empty() {

@@ -17,7 +17,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Single-instance PBFT ordering of complete batch proposals.")
+        .about("Parallel PBFT instances with independent per-instance delivery.")
         .args_from_usage("-v... 'Sets the level of verbosity'")
         .subcommand(
             SubCommand::with_name("generate_keys")
@@ -99,7 +99,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
-    // Channels the sequence of committed PBFT batches.
+    // Channels committed batches with independent (instance, sequence) positions.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
     // The primary command runs all authority tasks in this process.
@@ -127,7 +127,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     unreachable!();
 }
 
-/// Receives a contiguous sequence of committed PBFT batches.
+/// Receives a contiguous sequence per instance; cross-instance order is unspecified.
 async fn analyze(mut rx_output: Receiver<CommittedBatch>) {
     while let Some(_decision) = rx_output.recv().await {
         // NOTE: Here goes the application logic.

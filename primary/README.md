@@ -1,21 +1,22 @@
-# Single-instance PBFT
+# Parallel PBFT instances
 
-`messages.rs` defines transaction batches, signed PrePrepare/Prepare/Commit
-messages, and locally emitted `CommittedBatch` proofs. `pbft.rs` is the
-deterministic state machine: it verifies messages, deduplicates senders, buffers
-early votes, and emits one Prepare, Commit, and decision per accepted slot.
+Each committee member leads one instance; IDs follow sorted committee key order.
+`primary.rs` starts every instance on every node, with separate Core tasks and
+channels. Its receiver routes messages by instance ID. The local transaction
+ingress feeds only the proposer for the local node's own instance.
 
-`core.rs` executes those actions: it stores the complete proposal before
-preparing, stores local phase messages before broadcasting, feeds local votes
-through the same state machine, and persists decisions before output. These
-writes do not implement crash recovery. Transport ACKs are separate from votes.
+`messages.rs` signs instance-aware positions and validates each proposal against
+its instance's fixed leader. `pbft.rs` owns one instance's slots, early votes,
+quorums, and contiguous cleanup watermark. It rejects messages for another
+instance before changing state. Epoch and view remain fixed at zero.
 
-`primary.rs` owns the common network port, client ingress, and backup-to-leader
-transaction forwarding. Only the fixed leader runs `proposer.rs`, which seals
-full/partial/empty batches and waits for its local decision before assigning the
-next sequence number. `consensus` verifies commit proofs and delivers only a
-contiguous sequence to the application; it does not run another voting phase.
+`core.rs` executes one instance's actions: it stores complete proposals before
+preparing and local votes before broadcasting, counts local votes once, and
+persists decisions with the full protocol position in the storage key. Proposer
+feedback and transport retry cleanup belong to that instance only. `transport.rs`
+multiplexes all local instances over one outgoing connection per remote node.
+These writes do not implement crash recovery.
 
-The fixed leader is the first committee key in sorted order; only epoch 0,
-instance 0, view 0 are supported. There is no DAG parent synchronization or
-Tusk ordering. See the root README for scope and validation commands.
+`consensus` verifies commit proofs and maintains separate delivery buffers for
+each instance. Output is ordered within an instance, with no cross-instance total
+order or waiting barrier. See the root README for scope and validation commands.

@@ -14,30 +14,35 @@ mod messages_tests;
 
 pub type Transaction = Vec<u8>;
 pub type Sequence = u64;
+pub type Instance = u64;
 /// Bounds slots and early votes retained before a proposal arrives.
 pub const SEQUENCE_WINDOW: Sequence = 128;
 
-pub fn leader(committee: &Committee) -> PublicKey {
-    *committee
-        .authorities
-        .keys()
-        .next()
-        .expect("Empty committee")
+/// Instance IDs are the ranks of their fixed leaders in committee key order.
+pub fn leader(committee: &Committee, instance: Instance) -> Option<PublicKey> {
+    if instance >= committee.size() as u64 {
+        return None;
+    }
+    committee.authorities.keys().nth(instance as usize).copied()
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Position {
     pub epoch: u64,
-    pub instance: u64,
+    pub instance: Instance,
     pub view: u64,
     pub sequence: Sequence,
 }
 
 impl Position {
     pub fn new(sequence: Sequence) -> Self {
+        Self::for_instance(0, sequence)
+    }
+
+    pub fn for_instance(instance: Instance, sequence: Sequence) -> Self {
         Self {
             epoch: 0,
-            instance: 0,
+            instance,
             view: 0,
             sequence,
         }
@@ -45,10 +50,15 @@ impl Position {
 
     pub fn verify(&self) -> PbftResult<()> {
         ensure!(
-            self.epoch == 0 && self.instance == 0 && self.view == 0 && self.sequence > 0,
+            self.epoch == 0 && self.view == 0 && self.sequence > 0,
             PbftError::UnsupportedPosition(*self)
         );
         Ok(())
+    }
+
+    fn verify_instance(&self, committee: &Committee) -> PbftResult<PublicKey> {
+        self.verify()?;
+        leader(committee, self.instance).ok_or(PbftError::UnknownInstance(self.instance))
     }
 
     fn hash_into(&self, hasher: &mut Sha512) {
@@ -99,13 +109,13 @@ pub struct PrePrepare {
 
 impl PrePrepare {
     pub async fn new(
-        sequence: Sequence,
+        position: Position,
         batch: Batch,
         author: PublicKey,
         signatures: &mut SignatureService,
     ) -> Self {
         let mut proposal = Self {
-            position: Position::new(sequence),
+            position,
             batch,
             author,
             signature: Signature::default(),
@@ -115,13 +125,13 @@ impl PrePrepare {
     }
 
     pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
-        self.position.verify()?;
+        let expected_leader = self.position.verify_instance(committee)?;
         ensure!(
             committee.stake(&self.author) > 0,
             PbftError::UnknownAuthority(self.author)
         );
         ensure!(
-            self.author == leader(committee),
+            self.author == expected_leader,
             PbftError::UnexpectedLeader(self.author)
         );
         ensure!(
@@ -178,7 +188,7 @@ macro_rules! phase_message {
             }
 
             pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
-                self.position.verify()?;
+                self.position.verify_instance(committee)?;
                 ensure!(
                     committee.stake(&self.author) > 0,
                     PbftError::UnknownAuthority(self.author)

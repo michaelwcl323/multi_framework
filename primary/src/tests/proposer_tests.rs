@@ -7,13 +7,14 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn proposer_waits_for_matching_commit_before_next_sequence() {
-    let name = leader(&committee());
+    let name = leader(&committee(), 0).unwrap();
     let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
     let (tx_committed, rx_committed) = channel(10);
     let (tx_transactions, rx_transactions) = channel(10);
     let (tx_proposals, mut proposals) = channel(10);
     Proposer::spawn(
         name,
+        0,
         SignatureService::new(secret),
         32,
         20,
@@ -50,13 +51,14 @@ async fn proposer_waits_for_matching_commit_before_next_sequence() {
 
 #[tokio::test]
 async fn full_batch_proposes_without_dag_parents_or_availability_ack() {
-    let name = leader(&committee());
+    let name = leader(&committee(), 0).unwrap();
     let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
     let (_tx_committed, rx_committed) = channel(1);
     let (tx_transactions, rx_transactions) = channel(1);
     let (tx_proposals, mut proposals) = channel(1);
     Proposer::spawn(
         name,
+        0,
         SignatureService::new(secret),
         32,
         1_000_000,

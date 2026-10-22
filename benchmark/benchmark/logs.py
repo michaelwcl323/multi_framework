@@ -15,7 +15,8 @@ class ParseError(Exception):
 
 class LogParser:
     def __init__(self, clients, primaries, workers, faults=0):
-        self.pbft = any('Single-instance PBFT enabled' in log for log in primaries)
+        self.multibft = any('MultiBFT enabled' in log for log in primaries)
+        self.pbft = self.multibft or any('Single-instance PBFT enabled' in log for log in primaries)
         self.direct_batches = any('Direct batch proposals enabled' in log for log in primaries)
         self.integrated = self.pbft or self.direct_batches or not workers or any('Integrated batch service' in log for log in primaries)
         if self.integrated:
@@ -181,7 +182,7 @@ class LogParser:
 
     def _end_to_end_latency(self):
         if self.pbft:
-            # A backup's client input is proposed and logged by the fixed leader.
+            # Match samples globally, including historical forwarded-client logs.
             sent = {sample: timestamp for samples in self.sent_samples
                     for sample, timestamp in samples.items()}
             received = {sample: batch for samples in self.received_samples
@@ -215,6 +216,8 @@ class LogParser:
         end_to_end_latency = self._end_to_end_latency() * 1_000
 
         topology = (
+            ' Node processes per authority: 1 (MultiBFT)\n'
+            if self.multibft else
             ' Node processes per authority: 1 (single-instance PBFT)\n'
             if self.pbft else
             ' Node processes per authority: 1 (direct batch proposals)\n'

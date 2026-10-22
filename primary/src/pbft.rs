@@ -1,6 +1,6 @@
 use crate::error::{PbftError, PbftResult};
 use crate::messages::{
-    Commit, CommittedBatch, PbftMessage, PrePrepare, Prepare, Sequence, SEQUENCE_WINDOW,
+    Commit, CommittedBatch, Instance, PbftMessage, PrePrepare, Prepare, Sequence, SEQUENCE_WINDOW,
 };
 use config::{Committee, Stake};
 use crypto::{Hash as _, PublicKey};
@@ -31,20 +31,33 @@ struct Slot {
 /// through `process`, exactly like remote votes; transport ACKs never enter here.
 pub(crate) struct Pbft {
     committee: Committee,
+    instance: Instance,
     slots: BTreeMap<Sequence, Slot>,
     pub low_watermark: Sequence,
 }
 
 impl Pbft {
-    pub fn new(committee: Committee) -> Self {
+    pub fn new(committee: Committee, instance: Instance) -> Self {
+        assert!(
+            crate::leader(&committee, instance).is_some(),
+            "Unknown PBFT instance"
+        );
         Self {
             committee,
+            instance,
             slots: BTreeMap::new(),
             low_watermark: 1,
         }
     }
 
     pub fn process(&mut self, message: PbftMessage) -> PbftResult<Vec<Action>> {
+        ensure!(
+            message.position().instance == self.instance,
+            PbftError::WrongInstance {
+                expected: self.instance,
+                received: message.position().instance
+            }
+        );
         message.verify(&self.committee)?;
         let sequence = message.position().sequence;
         if sequence < self.low_watermark {
