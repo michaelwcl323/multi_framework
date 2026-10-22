@@ -13,6 +13,7 @@ use std::fmt;
 mod messages_tests;
 
 pub type Transaction = Vec<u8>;
+/// One-based slot index within a finite, epoch-specific segment.
 pub type Sequence = u64;
 pub type Instance = u64;
 /// Bounds slots and early votes retained before a proposal arrives.
@@ -40,8 +41,12 @@ impl Position {
     }
 
     pub fn for_instance(instance: Instance, sequence: Sequence) -> Self {
+        Self::for_epoch(0, instance, sequence)
+    }
+
+    pub fn for_epoch(epoch: u64, instance: Instance, sequence: Sequence) -> Self {
         Self {
-            epoch: 0,
+            epoch,
             instance,
             view: 0,
             sequence,
@@ -50,7 +55,7 @@ impl Position {
 
     pub fn verify(&self) -> PbftResult<()> {
         ensure!(
-            self.epoch == 0 && self.view == 0 && self.sequence > 0,
+            self.view == 0 && self.sequence > 0,
             PbftError::UnsupportedPosition(*self)
         );
         Ok(())
@@ -239,7 +244,7 @@ impl PbftMessage {
     }
 }
 
-/// Local output, never an additional broadcast phase in the normal path.
+/// A segment decision, multiplexed into the epoch's global log by delivery.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommittedBatch {
     pub proposal: PrePrepare,

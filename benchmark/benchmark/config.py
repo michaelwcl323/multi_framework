@@ -179,7 +179,11 @@ class NodeParameters:
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
 
-        self.json = json
+        segment_length = json.get('segment_length', 25)
+        if type(segment_length) is not int or segment_length <= 0:
+            raise ConfigError('segment_length must be a positive integer')
+        self.json = dict(json, segment_length=segment_length)
+        self.json.pop('epoch_length', None)
 
     def print(self, filename):
         assert isinstance(filename, str)

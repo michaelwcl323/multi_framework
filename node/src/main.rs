@@ -9,6 +9,7 @@ use env_logger::Env;
 use primary::{CommittedBatch, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::watch;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -107,14 +108,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         // Spawn the primary and consensus core.
         ("primary", _) => {
             let (tx_decisions, rx_decisions) = channel(CHANNEL_CAPACITY);
+            let (tx_epoch, rx_epoch) = watch::channel(0);
+            let epoch_length = parameters
+                .epoch_length(committee.size())
+                .context("Invalid segment length or epoch length overflow")?;
             Primary::spawn(
                 keypair,
                 committee.clone(),
                 parameters.clone(),
                 store.clone(),
                 tx_decisions,
+                rx_epoch,
             );
-            Consensus::spawn(committee, rx_decisions, tx_output);
+            Consensus::spawn(committee, epoch_length, tx_epoch, rx_decisions, tx_output);
         }
 
         _ => unreachable!(),
@@ -127,7 +133,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     unreachable!();
 }
 
-/// Receives a contiguous sequence per instance; cross-instance order is unspecified.
+/// Receives the contiguous global log across segments and epochs.
 async fn analyze(mut rx_output: Receiver<CommittedBatch>) {
     while let Some(_decision) = rx_output.recv().await {
         // NOTE: Here goes the application logic.

@@ -1,4 +1,3 @@
-// Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use config::{Authority, PrimaryAddresses};
 use crypto::{generate_keypair, SignatureService};
@@ -6,9 +5,9 @@ use primary::{leader, Batch, Commit, Position, PrePrepare};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use tokio::sync::mpsc::channel;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
-async fn fixtures() -> (Committee, Vec<CommittedBatch>) {
+async fn fixtures(length: u64, epochs: u64) -> (Committee, Vec<CommittedBatch>) {
     let mut rng = StdRng::from_seed([0; 32]);
     let keys: Vec<_> = (0..4).map(|_| generate_keypair(&mut rng)).collect();
     let committee = Committee {
@@ -34,17 +33,19 @@ async fn fixtures() -> (Committee, Vec<CommittedBatch>) {
         .map(|(name, secret)| (name, SignatureService::new(secret)))
         .collect();
     let mut decisions = Vec::new();
-    for instance in 0..committee.size() as u64 {
-        let owner = leader(&committee, instance).unwrap();
-        for sequence in 1..=3 {
+    for number in 0..epochs {
+        let epoch = Epoch::new(number, length, 4).unwrap();
+        for sn in epoch.first_sn()..=epoch.last_sn() {
+            let position = epoch.position(sn).unwrap();
+            let owner = leader(&committee, position.instance).unwrap();
             let signer = signers.iter_mut().find(|(name, _)| *name == owner).unwrap();
-            let proposal = PrePrepare::new(
-                Position::for_instance(instance, sequence),
-                Batch::new(vec![vec![sequence as u8]]),
-                owner,
-                &mut signer.1,
-            )
-            .await;
+            let transactions = if sn % 2 == 0 {
+                Vec::new()
+            } else {
+                vec![vec![sn as u8]]
+            };
+            let proposal =
+                PrePrepare::new(position, Batch::new(transactions), owner, &mut signer.1).await;
             let mut commits = Vec::new();
             for (name, signatures) in signers.iter_mut().take(3) {
                 commits.push(Commit::new(&proposal, *name, signatures).await);
@@ -56,93 +57,176 @@ async fn fixtures() -> (Committee, Vec<CommittedBatch>) {
 }
 
 #[tokio::test]
-async fn delivers_contiguous_prefix_despite_reordering_and_retries() {
-    let (committee, decisions) = fixtures().await;
-    let (tx, rx) = channel(10);
-    let (output, mut delivered) = channel(10);
-    Consensus::spawn(committee, rx, output);
+async fn delivers_global_round_robin_order_despite_reordering_and_retries() {
+    let (committee, decisions) = fixtures(8, 1).await;
+    let (tx, rx) = channel(32);
+    let (output, mut delivered) = channel(32);
+    let (epoch, mut progress) = watch::channel(0);
+    Consensus::spawn(committee, 8, epoch, rx, output);
     tx.send(decisions[1].clone()).await.unwrap();
     tx.send(decisions[1].clone()).await.unwrap();
-    assert!(timeout(Duration::from_millis(50), delivered.recv())
+    assert!(timeout(Duration::from_millis(30), delivered.recv())
         .await
         .is_err());
-    tx.send(decisions[0].clone()).await.unwrap();
-    tx.send(decisions[0].clone()).await.unwrap();
-    tx.send(decisions[2].clone()).await.unwrap();
-    drop(tx);
-    for sequence in 1..=3 {
+    for index in [0, 3, 2, 7, 6, 5, 4] {
+        tx.send(decisions[index].clone()).await.unwrap();
+    }
+    for sn in 1..=8 {
         let decision = timeout(Duration::from_secs(1), delivered.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(decision.proposal.position.sequence, sequence);
+        assert_eq!(
+            decision.proposal.position,
+            Epoch::new(0, 8, 4).unwrap().position(sn).unwrap()
+        );
     }
-    assert!(timeout(Duration::from_secs(1), delivered.recv())
-        .await
-        .unwrap()
-        .is_none());
-}
-
-#[tokio::test]
-async fn invalid_quorum_never_reaches_application_output() {
-    let (committee, mut decisions) = fixtures().await;
-    let (tx, rx) = channel(10);
-    let (output, mut delivered) = channel(10);
-    Consensus::spawn(committee, rx, output);
-    let mut invalid = decisions[0].clone();
-    invalid.commits = vec![invalid.commits[0].clone(); 3];
-    tx.send(invalid).await.unwrap();
-    tx.send(decisions.remove(1)).await.unwrap();
-    assert!(timeout(Duration::from_millis(50), delivered.recv())
-        .await
-        .is_err());
-    tx.send(decisions.remove(0)).await.unwrap();
-    let decision = timeout(Duration::from_secs(1), delivered.recv())
+    timeout(Duration::from_secs(1), progress.changed())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(decision.proposal.position.sequence, 1);
+    assert_eq!(*progress.borrow(), 1);
+    drop(tx);
+    assert!(timeout(Duration::from_secs(1), delivered.recv())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
-async fn a_gap_in_one_instance_does_not_block_other_instances() {
-    let (committee, decisions) = fixtures().await;
-    let (tx, rx) = channel(10);
-    let (output, mut delivered) = channel(10);
-    Consensus::spawn(committee, rx, output);
-    // Instance 0's sequence 2 is blocked; instance 1's sequence 2 waits only for 1.
-    tx.send(decisions[1].clone()).await.unwrap();
-    tx.send(decisions[4].clone()).await.unwrap();
-    tx.send(decisions[3].clone()).await.unwrap();
-    for sequence in 1..=2 {
-        let decision = timeout(Duration::from_secs(1), delivered.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            decision.proposal.position,
-            Position::for_instance(1, sequence)
-        );
+async fn missing_slot_blocks_epoch_and_invalid_quorum_does_not_fill_it() {
+    let (committee, decisions) = fixtures(7, 2).await;
+    let (tx, rx) = channel(32);
+    let (output, mut delivered) = channel(32);
+    let (epoch, mut progress) = watch::channel(0);
+    Consensus::spawn(committee, 7, epoch, rx, output);
+    for decision in &decisions[1..7] {
+        tx.send(decision.clone()).await.unwrap();
     }
-    assert!(timeout(Duration::from_millis(50), delivered.recv())
+    tx.send(decisions[6].clone()).await.unwrap();
+    // An early next-epoch decision cannot bypass the missing current-epoch slot.
+    tx.send(decisions[7].clone()).await.unwrap();
+    let mut invalid = decisions[0].clone();
+    invalid.commits = vec![invalid.commits[0].clone(); 3];
+    tx.send(invalid).await.unwrap();
+    assert!(timeout(Duration::from_millis(30), delivered.recv())
         .await
         .is_err());
-    // Instance 0's buffered entry survives instance 1's progress.
+    assert_eq!(*progress.borrow(), 0);
     tx.send(decisions[0].clone()).await.unwrap();
-    tx.send(decisions[0].clone()).await.unwrap();
-    for sequence in 1..=2 {
+    for sn in 1..=7 {
         let decision = timeout(Duration::from_secs(1), delivered.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
             decision.proposal.position,
-            Position::for_instance(0, sequence)
+            Epoch::new(0, 7, 4).unwrap().position(sn).unwrap()
         );
+    }
+    timeout(Duration::from_secs(1), progress.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*progress.borrow(), 1);
+    tx.send(decisions[0].clone()).await.unwrap();
+    tx.send(decisions[7].clone()).await.unwrap();
+    let next = timeout(Duration::from_secs(1), delivered.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.proposal.position, Position::for_epoch(1, 0, 1));
+    assert!(timeout(Duration::from_millis(30), delivered.recv())
+        .await
+        .is_err());
+    assert_eq!(*progress.borrow(), 1);
+}
+
+#[tokio::test]
+async fn completed_epochs_reset_local_sequences_without_duplicate_delivery() {
+    let (committee, decisions) = fixtures(7, 3).await;
+    let (tx, rx) = channel(64);
+    let (output, mut delivered) = channel(64);
+    let (epoch, mut progress) = watch::channel(0);
+    Consensus::spawn(committee, 7, epoch, rx, output);
+    for number in 0..3 {
+        for decision in decisions[number * 7..(number + 1) * 7].iter().rev() {
+            tx.send(decision.clone()).await.unwrap();
+            tx.send(decision.clone()).await.unwrap();
+        }
+        for sn in number as u64 * 7 + 1..=(number as u64 + 1) * 7 {
+            let decision = timeout(Duration::from_secs(1), delivered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                Epoch::new(number as u64, 7, 4)
+                    .unwrap()
+                    .global_sn(decision.proposal.position),
+                Some(sn)
+            );
+        }
+        timeout(Duration::from_secs(1), progress.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*progress.borrow(), number as u64 + 1);
     }
     drop(tx);
     assert!(timeout(Duration::from_secs(1), delivered.recv())
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn signed_decision_outside_segment_quota_is_rejected() {
+    let (committee, decisions) = fixtures(12, 1).await;
+    let (tx, rx) = channel(10);
+    let (output, mut delivered) = channel(10);
+    let (epoch, progress) = watch::channel(0);
+    Consensus::spawn(committee, 7, epoch, rx, output);
+    // Valid signatures, but segment 3 has only one slot in a seven-slot epoch.
+    tx.send(decisions[7].clone()).await.unwrap();
+    assert!(timeout(Duration::from_millis(30), delivered.recv())
+        .await
+        .is_err());
+    assert_eq!(*progress.borrow(), 0);
+    tx.send(decisions[0].clone()).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), delivered.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .proposal
+            .position,
+        Position::for_epoch(0, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn epoch_barrier_waits_for_last_slot_to_enter_output_channel() {
+    let (committee, decisions) = fixtures(2, 1).await;
+    let (tx, rx) = channel(10);
+    let (output, mut delivered) = channel(1);
+    let (epoch, mut progress) = watch::channel(0);
+    Consensus::spawn(committee, 2, epoch, rx, output);
+    for decision in decisions {
+        tx.send(decision).await.unwrap();
+    }
+    sleep(Duration::from_millis(30)).await;
+    assert_eq!(*progress.borrow(), 0);
+    assert_eq!(
+        delivered.recv().await.unwrap().proposal.position.instance,
+        0
+    );
+    timeout(Duration::from_secs(1), progress.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*progress.borrow(), 1);
+    assert_eq!(
+        delivered.recv().await.unwrap().proposal.position.instance,
+        1
+    );
 }

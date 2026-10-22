@@ -1,3 +1,4 @@
+use crate::epoch::Segment;
 use crate::error::{PbftError, PbftResult};
 use crate::messages::{
     Commit, CommittedBatch, Instance, PbftMessage, PrePrepare, Prepare, Sequence, SEQUENCE_WINDOW,
@@ -33,12 +34,14 @@ struct Slot {
 pub(crate) struct Pbft {
     committee: Committee,
     instance: Instance,
+    pub segment: Segment,
     slots: BTreeMap<Sequence, Slot>,
     pub low_watermark: Sequence,
 }
 
 impl Pbft {
-    pub fn new(committee: Committee, instance: Instance) -> Self {
+    pub fn new(committee: Committee, segment: Segment) -> Self {
+        let instance = segment.instance;
         assert!(
             crate::leader(&committee, instance).is_some(),
             "Unknown PBFT instance"
@@ -46,12 +49,20 @@ impl Pbft {
         Self {
             committee,
             instance,
+            segment,
             slots: BTreeMap::new(),
             low_watermark: 1,
         }
     }
 
     pub fn process(&mut self, message: PbftMessage) -> PbftResult<Vec<Action>> {
+        ensure!(
+            message.position().epoch == self.segment.epoch,
+            PbftError::WrongEpoch {
+                expected: self.segment.epoch,
+                received: message.position().epoch,
+            }
+        );
         ensure!(
             message.position().instance == self.instance,
             PbftError::WrongInstance {
@@ -61,6 +72,10 @@ impl Pbft {
         );
         message.verify(&self.committee)?;
         let sequence = message.position().sequence;
+        ensure!(
+            self.segment.global_sn(sequence).is_some(),
+            PbftError::OutsideSegment(message.position())
+        );
         if sequence < self.low_watermark {
             return Ok(Vec::new());
         }
@@ -175,6 +190,12 @@ impl Pbft {
         while matches!(self.slots.get(&self.low_watermark), Some(slot) if slot.decided) {
             self.slots.remove(&self.low_watermark);
             self.low_watermark += 1;
+        }
+        if self.low_watermark > self.segment.slots {
+            debug!(
+                "Completed segment epoch={} instance={} slots={}",
+                self.segment.epoch, self.segment.instance, self.segment.slots
+            );
         }
         Ok(actions)
     }

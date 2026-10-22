@@ -60,6 +60,9 @@ pub type WorkerId = u32;
 
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
+    /// Number of entries assigned to each segment in an ISS epoch.
+    #[serde(default = "default_segment_length")]
+    pub segment_length: u64,
     /// Number of recent decided sequence numbers to retain transport retries for.
     pub gc_depth: u64,
     /// Legacy compatibility field; unused by the PBFT normal path.
@@ -74,9 +77,14 @@ pub struct Parameters {
     pub max_batch_delay: u64,
 }
 
+fn default_segment_length() -> u64 {
+    25
+}
+
 impl Default for Parameters {
     fn default() -> Self {
         Self {
+            segment_length: default_segment_length(),
             gc_depth: 50,
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
@@ -89,7 +97,15 @@ impl Default for Parameters {
 impl Import for Parameters {}
 
 impl Parameters {
+    pub fn epoch_length(&self, segments: usize) -> Option<u64> {
+        if self.segment_length == 0 || segments == 0 {
+            return None;
+        }
+        self.segment_length.checked_mul(segments as u64)
+    }
+
     pub fn log(&self) {
+        info!("Segment length set to {} entries", self.segment_length);
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay);
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
@@ -256,5 +272,49 @@ impl KeyPair {
 impl Default for KeyPair {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_length_defaults_to_25_and_epoch_length_scales_with_committee() {
+        let mut json = serde_json::json!({
+            "gc_depth": 50,
+            "sync_retry_delay": 1000,
+            "sync_retry_nodes": 3,
+            "batch_size": 2048000,
+            "max_batch_delay": 200
+        });
+        let legacy: Parameters = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(legacy.segment_length, 25);
+        assert_eq!(legacy.epoch_length(4), Some(100));
+        assert_eq!(legacy.epoch_length(10), Some(250));
+        assert_eq!(legacy.epoch_length(0), None);
+        json["epoch_length"] = 1000.into();
+        let legacy_epoch: Parameters = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(legacy_epoch.epoch_length(10), Some(250));
+        json["segment_length"] = 7.into();
+        let explicit: Parameters = serde_json::from_value(json).unwrap();
+        assert_eq!(explicit.segment_length, 7);
+        assert_eq!(explicit.epoch_length(4), Some(28));
+        assert_eq!(
+            Parameters {
+                segment_length: 0,
+                ..Parameters::default()
+            }
+            .epoch_length(4),
+            None
+        );
+        assert_eq!(
+            Parameters {
+                segment_length: u64::MAX,
+                ..Parameters::default()
+            }
+            .epoch_length(10),
+            None
+        );
     }
 }

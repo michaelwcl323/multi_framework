@@ -2,6 +2,7 @@
 #[macro_use]
 mod error;
 mod core;
+mod epoch;
 mod messages;
 mod pbft;
 mod primary;
@@ -12,6 +13,7 @@ mod transport;
 #[path = "tests/common.rs"]
 mod common;
 
+pub use crate::epoch::{Epoch, GlobalSn, Segment};
 pub use crate::error::{PbftError, PbftResult};
 pub use crate::messages::{
     leader, Batch, Commit, CommittedBatch, Instance, PbftMessage, Position, PrePrepare, Prepare,

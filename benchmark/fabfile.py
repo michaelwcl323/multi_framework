@@ -224,19 +224,20 @@ def cloudlab_install(ctx):
 
 
 @task
-def cloudlab_remote(ctx, debug=True):
+def cloudlab_remote(ctx, debug=False):
     ''' Run benchmarks on CloudLab '''
     bench_params = {
         'faults': 0,
         'nodes': [10],
         'workers': 1,
         'collocate': True,
-        'rate': [80000],
+        'rate': [200000],
         'tx_size': 512,
         'duration': 120,
         'runs': 1,
     }
     node_params = {
+        'segment_length': 25,  # entries per segment
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 1000,  # ms
         'sync_retry_nodes': 3,  # number of nodes

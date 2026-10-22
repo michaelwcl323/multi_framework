@@ -53,6 +53,10 @@ pub enum PbftError {
         expected: Instance,
         received: Instance,
     },
+    #[error("Message targets epoch {received}, expected {expected}")]
+    WrongEpoch { expected: u64, received: u64 },
+    #[error("Position is outside its finite segment: {0:?}")]
+    OutsideSegment(Position),
     #[error("Sequence {0} is beyond the receive window")]
     OutsideWindow(Sequence),
     #[error("Conflicting proposal at sequence {0}")]

@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::epoch::{Epoch, Segment};
 use crate::messages::{Batch, Instance, Position, PrePrepare, Sequence, Transaction};
 use crypto::{Hash as _, PublicKey, SignatureService};
 use log::debug;
@@ -7,6 +8,7 @@ use log::info;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 use tokio::time::{sleep, Duration, Instant};
 
 #[cfg(test)]
@@ -16,10 +18,14 @@ mod tests;
 pub(crate) struct Proposer {
     name: PublicKey,
     instance: Instance,
+    segment: Segment,
+    epoch_length: u64,
+    segments: u64,
+    rx_epoch: watch::Receiver<u64>,
     signatures: SignatureService,
     batch_size: usize,
     max_batch_delay: u64,
-    rx_committed: Receiver<Sequence>,
+    rx_committed: Receiver<Position>,
     rx_transactions: Receiver<Transaction>,
     tx_core: Sender<PrePrepare>,
     sequence: Sequence,
@@ -33,17 +39,26 @@ impl Proposer {
     pub fn spawn(
         name: PublicKey,
         instance: Instance,
+        epoch_length: u64,
+        segments: u64,
+        rx_epoch: watch::Receiver<u64>,
         signatures: SignatureService,
         batch_size: usize,
         max_batch_delay: u64,
-        rx_committed: Receiver<Sequence>,
+        rx_committed: Receiver<Position>,
         rx_transactions: Receiver<Transaction>,
         tx_core: Sender<PrePrepare>,
     ) {
         tokio::spawn(async move {
+            let epoch = Epoch::new(*rx_epoch.borrow(), epoch_length, segments)
+                .expect("Invalid epoch layout");
             Self {
                 name,
                 instance,
+                segment: epoch.segment(instance).expect("Unknown segment"),
+                epoch_length,
+                segments,
+                rx_epoch,
                 signatures,
                 batch_size,
                 max_batch_delay,
@@ -63,17 +78,18 @@ impl Proposer {
     async fn make_proposal(&mut self) {
         let batch = Batch::new(self.transactions.drain(..).collect());
         let proposal = PrePrepare::new(
-            Position::for_instance(self.instance, self.sequence),
+            Position::for_epoch(self.segment.epoch, self.instance, self.sequence),
             batch,
             self.name,
             &mut self.signatures,
         )
         .await;
         debug!(
-            "Created {} -> {:?} position={:?} batch={:?} tx_count={} tx_bytes={}",
+            "Created {} -> {:?} position={:?} global_sn={} batch={:?} tx_count={} tx_bytes={}",
             proposal,
             proposal.digest(),
             proposal.position,
+            self.segment.global_sn(self.sequence).unwrap(),
             proposal.batch.id,
             proposal.batch.transactions.len(),
             self.payload_size
@@ -104,15 +120,34 @@ impl Proposer {
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
         loop {
-            if !self.in_flight && (timer.is_elapsed() || self.payload_size >= self.batch_size) {
+            let epoch_number = *self.rx_epoch.borrow_and_update();
+            if epoch_number != self.segment.epoch {
+                assert!(
+                    epoch_number > self.segment.epoch,
+                    "Epoch must not move backwards"
+                );
+                self.segment = Epoch::new(epoch_number, self.epoch_length, self.segments)
+                    .expect("Global sequence space exhausted")
+                    .segment(self.instance)
+                    .unwrap();
+                self.sequence = 1;
+                self.in_flight = false;
+                timer
+                    .as_mut()
+                    .reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+            }
+            if self.sequence <= self.segment.slots
+                && !self.in_flight
+                && (timer.is_elapsed() || self.payload_size >= self.batch_size)
+            {
                 self.make_proposal().await;
                 timer
                     .as_mut()
                     .reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
             }
             tokio::select! {
-                Some(sequence) = self.rx_committed.recv() => {
-                    if self.in_flight && sequence == self.sequence {
+                Some(position) = self.rx_committed.recv() => {
+                    if self.in_flight && position == Position::for_epoch(self.segment.epoch, self.instance, self.sequence) {
                         self.in_flight = false;
                         self.sequence += 1;
                     }
@@ -121,6 +156,9 @@ impl Proposer {
                     self.payload_size += transaction.len();
                     self.transactions.push(transaction);
                 }
+                changed = self.rx_epoch.changed() => {
+                    if changed.is_err() { return; }
+                },
                 _ = &mut timer, if !timer.is_elapsed() => {},
                 else => break,
             }

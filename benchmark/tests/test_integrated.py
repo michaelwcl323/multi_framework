@@ -6,13 +6,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from benchmark.config import BenchParameters, Committee, ConfigError
+from benchmark.config import BenchParameters, Committee, ConfigError, NodeParameters
 from benchmark.logs import LogParser
 from benchmark.commands import CommandMaker
 from benchmark.cloudlab_remote import CloudLabBench
 
 
 class IntegratedBenchTests(unittest.TestCase):
+    def test_segment_length_defaults_and_rejects_invalid_values(self):
+        params = dict(gc_depth=50, sync_retry_delay=1000, sync_retry_nodes=3,
+                      batch_size=2048000, max_batch_delay=200)
+        self.assertEqual(NodeParameters(params).json['segment_length'], 25)
+        self.assertEqual(NodeParameters(dict(params, segment_length=7)).json['segment_length'], 7)
+        self.assertNotIn('epoch_length', NodeParameters(dict(params, epoch_length=1000)).json)
+        for value in [0, -1, 2.5, '7', True]:
+            with self.assertRaises(ConfigError):
+                NodeParameters(dict(params, segment_length=value))
+
     def test_cloudlab_resolves_binaries_with_explicit_logging_environment(self):
         runner = CloudLabBench.__new__(CloudLabBench)
         runner.settings = SimpleNamespace(repo_name='iss')

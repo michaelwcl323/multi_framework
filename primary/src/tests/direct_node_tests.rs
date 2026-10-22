@@ -35,6 +35,7 @@ async fn parallel_instances_reach_quorum_independently_with_one_leader_offline()
     live_keys.pop(); // Instance 3 has no live leader, but its replicas still run.
     let names: Vec<_> = live_keys.iter().map(|(name, _)| *name).collect();
     let third = live_keys.pop().unwrap();
+    let (_epoch, rx_epoch) = tokio::sync::watch::channel(0);
     let mut stores = Vec::new();
     let mut outputs = Vec::new();
     let mut unused_ports = Vec::new();
@@ -63,6 +64,7 @@ async fn parallel_instances_reach_quorum_independently_with_one_leader_offline()
             parameters.clone(),
             store.clone(),
             tx,
+            rx_epoch.clone(),
         );
         stores.push(store);
         outputs.push(rx);
@@ -99,6 +101,7 @@ async fn parallel_instances_reach_quorum_independently_with_one_leader_offline()
         parameters,
         store.clone(),
         tx,
+        rx_epoch.clone(),
     );
     stores.push(store);
     outputs.push(rx);

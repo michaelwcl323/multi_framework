@@ -15,6 +15,7 @@ use std::error::Error;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::watch;
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
@@ -36,8 +37,12 @@ impl Primary {
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<CommittedBatch>,
+        rx_epoch: watch::Receiver<u64>,
     ) {
         assert!(parameters.batch_size > 0, "Batch size must be positive");
+        let epoch_length = parameters
+            .epoch_length(committee.size())
+            .expect("Segment length must be positive and epoch length must fit u64");
         let name = keypair.name;
         assert!(committee.stake(&name) > 0, "Node has no voting rights");
         let (tx_transactions, rx_transactions) = channel(CHANNEL_CAPACITY);
@@ -61,6 +66,8 @@ impl Primary {
                 name,
                 committee.clone(),
                 instance,
+                epoch_length,
+                rx_epoch.clone(),
                 store.clone(),
                 signatures.clone(),
                 parameters.gc_depth,
@@ -75,6 +82,9 @@ impl Primary {
                 Proposer::spawn(
                     name,
                     instance,
+                    epoch_length,
+                    committee.size() as u64,
+                    rx_epoch.clone(),
                     signatures.clone(),
                     parameters.batch_size,
                     parameters.max_batch_delay,

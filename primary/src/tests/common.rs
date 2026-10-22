@@ -74,13 +74,17 @@ pub fn proposal(sequence: u64, transactions: Vec<Vec<u8>>) -> PrePrepare {
 }
 
 pub fn proposal_for(instance: u64, sequence: u64, transactions: Vec<Vec<u8>>) -> PrePrepare {
-    let author = leader(&committee(), instance).unwrap();
+    proposal_at(Position::for_instance(instance, sequence), transactions)
+}
+
+pub fn proposal_at(position: Position, transactions: Vec<Vec<u8>>) -> PrePrepare {
+    let author = leader(&committee(), position.instance).unwrap();
     let (_, secret) = keys()
         .into_iter()
         .find(|(name, _)| *name == author)
         .unwrap();
     let mut proposal = PrePrepare {
-        position: Position::for_instance(instance, sequence),
+        position,
         batch: Batch::new(transactions),
         author,
         signature: Signature::default(),
