@@ -103,14 +103,9 @@ impl Core {
         }
         while let Some(action) = actions.pop_front() {
             let outgoing = match action {
-                Action::Prepare(proposal) => {
-                    // Keep the full proposal before issuing a Prepare for its digest.
-                    self.persist(proposal.digest().to_vec(), bincode::serialize(&proposal)?)
-                        .await?;
-                    Some(PbftMessage::Prepare(
-                        Prepare::new(&proposal, self.name, &mut self.signatures).await,
-                    ))
-                }
+                Action::Prepare(proposal) => Some(PbftMessage::Prepare(
+                    Prepare::new(&proposal, self.name, &mut self.signatures).await,
+                )),
                 Action::Commit(proposal) => Some(PbftMessage::Commit(
                     Commit::new(&proposal, self.name, &mut self.signatures).await,
                 )),
@@ -125,7 +120,9 @@ impl Core {
                     let sequence = decision.proposal.position.sequence;
                     let mut key = b"pbft/committed/".to_vec();
                     key.extend_from_slice(&bincode::serialize(&decision.proposal.position)?);
-                    self.persist(key, bincode::serialize(&decision)?).await?;
+                    // Store only the commit certificate, without proposal or batch payload.
+                    self.persist(key, bincode::serialize(&decision.commits)?)
+                        .await?;
                     self.tx_consensus
                         .send(decision)
                         .await
@@ -137,13 +134,6 @@ impl Core {
                 }
             };
             if let Some(message) = outgoing {
-                let mut key = b"pbft/local-vote/".to_vec();
-                key.extend_from_slice(&bincode::serialize(&message.position())?);
-                key.push(match &message {
-                    PbftMessage::Prepare(_) => 1,
-                    _ => 2,
-                });
-                self.persist(key, bincode::serialize(&message)?).await?;
                 // Count our vote through the same verified path as every remote vote.
                 actions.extend(self.pbft.process(message.clone())?);
                 self.broadcast(message).await;

@@ -1,9 +1,9 @@
 use super::*;
 use crate::common::{committee_with_base_port, keys};
-use crate::{Instance, Position, PrePrepare};
+use crate::{Commit, Instance, Position};
 use crypto::{Digest, Hash as _};
 use futures::SinkExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout, Duration};
@@ -132,20 +132,33 @@ async fn parallel_instances_reach_quorum_independently_with_one_leader_offline()
         }
         expected = Some(decisions);
     }
-    // Same local sequence, different instance: neither proposal nor commit proof
-    // may overwrite another instance in the shared RocksDB store.
+    // Persist only the final commit proof, independently for each instance.
     for store in &mut stores {
         for (instance, digest) in expected.as_ref().unwrap() {
-            let bytes = store.read(digest.to_vec()).await.unwrap().unwrap();
-            let proposal: PrePrepare = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(proposal.position.instance, *instance);
+            assert!(store.read(digest.to_vec()).await.unwrap().is_none());
+            let position = Position::for_instance(*instance, 1);
+            for phase in [1, 2] {
+                let mut key = b"pbft/local-vote/".to_vec();
+                key.extend_from_slice(&bincode::serialize(&position).unwrap());
+                key.push(phase);
+                assert!(store.read(key).await.unwrap().is_none());
+            }
             let mut key = b"pbft/committed/".to_vec();
-            key.extend_from_slice(
-                &bincode::serialize(&Position::for_instance(*instance, 1)).unwrap(),
-            );
+            key.extend_from_slice(&bincode::serialize(&position).unwrap());
             let bytes = store.read(key).await.unwrap().unwrap();
-            let committed: CommittedBatch = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(committed.proposal.digest(), *digest);
+            let proof: Vec<Commit> = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(bytes, bincode::serialize(&proof).unwrap());
+            assert_eq!(proof.len(), 3);
+            let mut voters = BTreeSet::new();
+            let mut weight = 0;
+            for vote in proof {
+                vote.verify(&committee).unwrap();
+                assert_eq!(vote.position, position);
+                assert_eq!(&vote.proposal, digest);
+                assert!(voters.insert(vote.author));
+                weight += committee.stake(&vote.author);
+            }
+            assert!(weight >= committee.quorum_threshold());
         }
     }
     // Continuing instance 1 must not wait for instance 0 or the absent leader 3.
