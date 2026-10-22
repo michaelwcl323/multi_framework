@@ -128,6 +128,7 @@ class IntegratedBenchTests(unittest.TestCase):
             line('00.200', 'Created B1(key) -> abc='),
             line('00.300', 'Batch pending= contains 512 B'),
             line('00.300', 'Created B2(key) -> pending='),
+            line('00.350', 'PBFT decided B2(key) -> pending= (instance 0)'),
             line('00.600', 'Committed B1(key) -> abc='),
         ])
         with tempfile.TemporaryDirectory() as directory:

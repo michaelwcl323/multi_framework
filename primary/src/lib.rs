@@ -16,7 +16,7 @@ mod common;
 pub use crate::epoch::{Epoch, GlobalSn, Segment};
 pub use crate::error::{PbftError, PbftResult};
 pub use crate::messages::{
-    leader, Batch, Commit, CommittedBatch, Instance, PbftMessage, Position, PrePrepare, Prepare,
-    Sequence, Transaction, SEQUENCE_WINDOW,
+    leader, Batch, Commit, CommittedBatch, GlobalSequence, Instance, PbftMessage, Position,
+    PrePrepare, Prepare, Sequence, Transaction, SEQUENCE_WINDOW,
 };
 pub use crate::primary::Primary;

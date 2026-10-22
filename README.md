@@ -41,6 +41,14 @@ segment stops at its finite quota. Decisions may arrive out of order, but the
 application receives exactly one contiguous log ordered by global SN. A missing
 slot blocks later delivery, including slots decided by other segments.
 
+Application output is `OrderedBatch { global_sequence, committed }`: the explicit
+global sequence accompanies the original proposal and Commit proof. Empty batches
+consume their assigned slots and advance the prefix without executing transactions.
+Duplicate results cannot repeat application output, conflicting buffered proofs
+are rejected, and all sequence arithmetic is checked through the finite epoch
+layout. Verified current-epoch results are retained even beyond the PBFT receive
+window. Finite segment quotas bound normal backlog until the epoch barrier opens.
+
 After **every required slot of the current epoch has entered the local output
 channel**, delivery opens the next epoch through a watch notification. Cores
 start fresh PBFT segment state and proposers reset their local slot counters.
@@ -79,6 +87,10 @@ retries across local slot resets using the equivalent distance in global SNs.
 Diagnostic `debug!()` logs include global SNs, batch transaction counts and
 payload bytes, segment completion, and epoch start/completion. Existing INFO
 benchmark records retain their parser-compatible prefixes and digest IDs.
+`PBFT decided` marks local agreement, while `Committed` marks the global delivery
+condition; locally decided batches waiting behind a gap do not count toward
+benchmark throughput or global ordering latency. `Globally ordered` debug logs
+also include empty slots and explicit global sequence numbers.
 
 Only the final commit-vote proof is written to RocksDB, under a key containing
 the complete protocol position. Proposal/batch payload and intermediate local

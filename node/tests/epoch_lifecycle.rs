@@ -110,10 +110,12 @@ async fn missing_segment_holds_epoch_then_all_nodes_deliver_three_identical_epoc
     client.send(Bytes::from(vec![7; 64])).await.unwrap();
     for i in 0..3 {
         for sn in 1..=3 {
-            let decision = timeout(Duration::from_secs(5), outputs[i].recv())
+            let ordered = timeout(Duration::from_secs(5), outputs[i].recv())
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(ordered.global_sequence, logs[i].len() as u64 + 1);
+            let decision = ordered.committed;
             assert_eq!(
                 Epoch::new(0, 8, 4)
                     .unwrap()
@@ -151,10 +153,12 @@ async fn missing_segment_holds_epoch_then_all_nodes_deliver_three_identical_epoc
     outputs.push(rx_output);
     for i in 0..4 {
         while logs[i].len() < 24 {
-            let decision = timeout(Duration::from_secs(10), outputs[i].recv())
+            let ordered = timeout(Duration::from_secs(10), outputs[i].recv())
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(ordered.global_sequence, logs[i].len() as u64 + 1);
+            let decision = ordered.committed;
             decision.verify(&committee).unwrap();
             let sn = logs[i].len() as u64 + 1;
             let epoch = Epoch::new((sn - 1) / 8, 8, 4).unwrap();

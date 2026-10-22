@@ -72,10 +72,11 @@ async fn delivers_global_round_robin_order_despite_reordering_and_retries() {
         tx.send(decisions[index].clone()).await.unwrap();
     }
     for sn in 1..=8 {
-        let decision = timeout(Duration::from_secs(1), delivered.recv())
+        let decision_ordered = timeout(Duration::from_secs(1), delivered.recv())
             .await
             .unwrap()
             .unwrap();
+        let decision = decision_ordered.committed;
         assert_eq!(
             decision.proposal.position,
             Epoch::new(0, 8, 4).unwrap().position(sn).unwrap()
@@ -115,10 +116,11 @@ async fn missing_slot_blocks_epoch_and_invalid_quorum_does_not_fill_it() {
     assert_eq!(*progress.borrow(), 0);
     tx.send(decisions[0].clone()).await.unwrap();
     for sn in 1..=7 {
-        let decision = timeout(Duration::from_secs(1), delivered.recv())
+        let decision_ordered = timeout(Duration::from_secs(1), delivered.recv())
             .await
             .unwrap()
             .unwrap();
+        let decision = decision_ordered.committed;
         assert_eq!(
             decision.proposal.position,
             Epoch::new(0, 7, 4).unwrap().position(sn).unwrap()
@@ -131,10 +133,11 @@ async fn missing_slot_blocks_epoch_and_invalid_quorum_does_not_fill_it() {
     assert_eq!(*progress.borrow(), 1);
     tx.send(decisions[0].clone()).await.unwrap();
     tx.send(decisions[7].clone()).await.unwrap();
-    let next = timeout(Duration::from_secs(1), delivered.recv())
+    let next_ordered = timeout(Duration::from_secs(1), delivered.recv())
         .await
         .unwrap()
         .unwrap();
+    let next = next_ordered.committed;
     assert_eq!(next.proposal.position, Position::for_epoch(1, 0, 1));
     assert!(timeout(Duration::from_millis(30), delivered.recv())
         .await
@@ -155,10 +158,11 @@ async fn completed_epochs_reset_local_sequences_without_duplicate_delivery() {
             tx.send(decision.clone()).await.unwrap();
         }
         for sn in number as u64 * 7 + 1..=(number as u64 + 1) * 7 {
-            let decision = timeout(Duration::from_secs(1), delivered.recv())
+            let decision_ordered = timeout(Duration::from_secs(1), delivered.recv())
                 .await
                 .unwrap()
                 .unwrap();
+            let decision = decision_ordered.committed;
             assert_eq!(
                 Epoch::new(number as u64, 7, 4)
                     .unwrap()
@@ -198,6 +202,7 @@ async fn signed_decision_outside_segment_quota_is_rejected() {
             .await
             .unwrap()
             .unwrap()
+            .committed
             .proposal
             .position,
         Position::for_epoch(0, 0, 1)
@@ -217,7 +222,14 @@ async fn epoch_barrier_waits_for_last_slot_to_enter_output_channel() {
     sleep(Duration::from_millis(30)).await;
     assert_eq!(*progress.borrow(), 0);
     assert_eq!(
-        delivered.recv().await.unwrap().proposal.position.instance,
+        delivered
+            .recv()
+            .await
+            .unwrap()
+            .committed
+            .proposal
+            .position
+            .instance,
         0
     );
     timeout(Duration::from_secs(1), progress.changed())
@@ -226,7 +238,14 @@ async fn epoch_barrier_waits_for_last_slot_to_enter_output_channel() {
         .unwrap();
     assert_eq!(*progress.borrow(), 1);
     assert_eq!(
-        delivered.recv().await.unwrap().proposal.position.instance,
+        delivered
+            .recv()
+            .await
+            .unwrap()
+            .committed
+            .proposal
+            .position
+            .instance,
         1
     );
 }

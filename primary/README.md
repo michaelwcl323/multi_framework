@@ -18,7 +18,9 @@ feedback from releasing a new proposal. Retry retention uses global SNs, so
 local sequence resets do not mix retry handles across epochs.
 
 `consensus` checks proofs and multiplexes decisions into a contiguous global
-log. It releases a local watch notification only after every required slot of
+log, returning `OrderedBatch` with an explicit `global_sequence` and the original
+`committed` proposal/proof. Duplicate and conflicting results cannot advance the
+prefix. It releases a local watch notification only after every required slot of
 the epoch has entered the output channel. Cores then reset their PBFT state and
 the local proposer starts a fresh finite segment. Each replica advances from
 its own complete log; no central epoch leader or network barrier is added.

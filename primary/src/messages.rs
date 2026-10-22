@@ -15,6 +15,7 @@ mod messages_tests;
 pub type Transaction = Vec<u8>;
 /// One-based slot index within a finite, epoch-specific segment.
 pub type Sequence = u64;
+pub type GlobalSequence = crate::epoch::GlobalSn;
 pub type Instance = u64;
 /// Bounds slots and early votes retained before a proposal arrives.
 pub const SEQUENCE_WINDOW: Sequence = 128;
@@ -59,6 +60,24 @@ impl Position {
             PbftError::UnsupportedPosition(*self)
         );
         Ok(())
+    }
+
+    /// Checked finite-epoch mapping, shared with the canonical ISS epoch layout.
+    pub fn global_sequence(
+        &self,
+        instance_count: u64,
+        epoch_length: u64,
+    ) -> PbftResult<GlobalSequence> {
+        self.verify()?;
+        ensure!(
+            self.instance < instance_count,
+            PbftError::UnknownInstance(self.instance)
+        );
+        let epoch = crate::epoch::Epoch::new(self.epoch, epoch_length, instance_count)
+            .ok_or(PbftError::GlobalSequenceOverflow(*self))?;
+        epoch
+            .global_sn(*self)
+            .ok_or(PbftError::OutsideSegment(*self))
     }
 
     fn verify_instance(&self, committee: &Committee) -> PbftResult<PublicKey> {

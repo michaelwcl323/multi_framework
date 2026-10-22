@@ -8,6 +8,8 @@ use crate::pbft::{Action, Pbft};
 use crate::transport::Network;
 use config::Committee;
 use crypto::{Hash as _, PublicKey, SignatureService};
+#[cfg(feature = "benchmark")]
+use log::info;
 use log::{debug, warn};
 use network::CancelHandler;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -179,6 +181,17 @@ impl Core {
                     Commit::new(&proposal, self.name, &mut self.signatures).await,
                 )),
                 Action::Decide(decision) => {
+                    #[cfg(feature = "benchmark")]
+                    if !decision.proposal.batch.transactions.is_empty() {
+                        info!(
+                            "PBFT decided {} -> {:?} (instance {}) epoch={} global_sn={}",
+                            decision.proposal,
+                            decision.proposal.digest(),
+                            decision.proposal.position.instance,
+                            self.epoch.number,
+                            self.epoch.global_sn(decision.proposal.position).unwrap()
+                        );
+                    }
                     debug!(
                         "PBFT decided {} position={:?} global_sn={} proposal={:?} commit_votes={}",
                         decision.proposal,

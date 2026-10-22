@@ -46,6 +46,10 @@ pub enum PbftError {
     MismatchedCommit,
     #[error("Unsupported protocol position {0:?}")]
     UnsupportedPosition(Position),
+    #[error("Global sequence overflows for position {0:?}")]
+    GlobalSequenceOverflow(Position),
+    #[error("Conflicting decisions for global sequence {0}")]
+    ConflictingGlobalDecision(Sequence),
     #[error("Unknown PBFT instance {0}")]
     UnknownInstance(Instance),
     #[error("Message targets instance {received}, expected {expected}")]

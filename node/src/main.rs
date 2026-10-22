@@ -4,9 +4,9 @@ use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
 use config::{Committee, KeyPair, Parameters};
-use consensus::Consensus;
+use consensus::{Consensus, OrderedBatch};
 use env_logger::Env;
-use primary::{CommittedBatch, Primary};
+use primary::Primary;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::watch;
@@ -18,7 +18,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Parallel PBFT instances with independent per-instance delivery.")
+        .about("Parallel PBFT segments with ISS global ordering and epochs.")
         .args_from_usage("-v... 'Sets the level of verbosity'")
         .subcommand(
             SubCommand::with_name("generate_keys")
@@ -100,7 +100,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
-    // Channels committed batches with independent (instance, sequence) positions.
+    // Application output carries an explicit contiguous global sequence.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
     // The primary command runs all authority tasks in this process.
@@ -134,8 +134,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 }
 
 /// Receives the contiguous global log across segments and epochs.
-async fn analyze(mut rx_output: Receiver<CommittedBatch>) {
-    while let Some(_decision) = rx_output.recv().await {
+async fn analyze(mut rx_output: Receiver<OrderedBatch>) {
+    while let Some(_ordered) = rx_output.recv().await {
         // NOTE: Here goes the application logic.
     }
 }
