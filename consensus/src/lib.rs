@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use config::Committee;
 use crypto::Hash as _;
-use log::{info, warn};
+use log::{debug, info, warn};
 use primary::{CommittedBatch, Instance, Sequence, SEQUENCE_WINDOW};
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -51,6 +51,20 @@ impl Consensus {
                 }
                 state.pending.insert(sequence, decision);
                 while let Some(decision) = state.pending.remove(&(state.delivered + 1)) {
+                    debug!(
+                        "Delivering position={:?} proposal={:?} batch={:?} tx_count={} tx_bytes={}",
+                        decision.proposal.position,
+                        decision.proposal.digest(),
+                        decision.proposal.batch.id,
+                        decision.proposal.batch.transactions.len(),
+                        decision
+                            .proposal
+                            .batch
+                            .transactions
+                            .iter()
+                            .map(Vec::len)
+                            .sum::<usize>()
+                    );
                     #[cfg(not(feature = "benchmark"))]
                     info!("Committed {} (instance {})", decision.proposal, instance);
                     #[cfg(feature = "benchmark")]

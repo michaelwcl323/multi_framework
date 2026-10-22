@@ -69,7 +69,15 @@ impl Proposer {
             &mut self.signatures,
         )
         .await;
-        debug!("Created {} -> {:?}", proposal, proposal.digest());
+        debug!(
+            "Created {} -> {:?} position={:?} batch={:?} tx_count={} tx_bytes={}",
+            proposal,
+            proposal.digest(),
+            proposal.position,
+            proposal.batch.id,
+            proposal.batch.transactions.len(),
+            self.payload_size
+        );
         #[cfg(feature = "benchmark")]
         if !proposal.batch.transactions.is_empty() {
             // The benchmark ID identifies the signed protocol position, including

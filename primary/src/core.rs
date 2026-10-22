@@ -76,6 +76,18 @@ impl Core {
     }
 
     async fn broadcast(&mut self, message: PbftMessage) {
+        let (phase, proposal) = match &message {
+            PbftMessage::PrePrepare(x) => ("PrePrepare", x.digest()),
+            PbftMessage::Prepare(x) => ("Prepare", x.proposal.clone()),
+            PbftMessage::Commit(x) => ("Commit", x.proposal.clone()),
+        };
+        debug!(
+            "Broadcast {} node={} position={:?} proposal={:?}",
+            phase,
+            self.name,
+            message.position(),
+            proposal
+        );
         let sequence = message.position().sequence;
         let handlers = self.network.broadcast(message).await;
         self.cancel_handlers
@@ -103,7 +115,13 @@ impl Core {
                     Commit::new(&proposal, self.name, &mut self.signatures).await,
                 )),
                 Action::Decide(decision) => {
-                    debug!("PBFT decided {}", decision.proposal);
+                    debug!(
+                        "PBFT decided {} position={:?} proposal={:?} commit_votes={}",
+                        decision.proposal,
+                        decision.proposal.position,
+                        decision.proposal.digest(),
+                        decision.commits.len()
+                    );
                     let sequence = decision.proposal.position.sequence;
                     let mut key = b"pbft/committed/".to_vec();
                     key.extend_from_slice(&bincode::serialize(&decision.proposal.position)?);

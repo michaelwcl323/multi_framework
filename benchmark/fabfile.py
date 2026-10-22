@@ -231,7 +231,7 @@ def cloudlab_remote(ctx, debug=False):
         'nodes': [10],
         'workers': 1,
         'collocate': True,
-        'rate': [20000, 40000, 60000],
+        'rate': [20000],
         'tx_size': 512,
         'duration': 120,
         'runs': 1,
@@ -240,7 +240,7 @@ def cloudlab_remote(ctx, debug=False):
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 1000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 500_000,  # bytes
+        'batch_size': 2_048_000,  # bytes
         'max_batch_delay': 200,  # ms
     }
     try:
