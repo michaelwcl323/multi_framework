@@ -228,12 +228,12 @@ def cloudlab_remote(ctx, debug=False):
     ''' Run benchmarks on CloudLab '''
     bench_params = {
         'faults': 0,
-        'nodes': [4],
+        'nodes': [10],
         'workers': 1,
         'collocate': True,
-        'rate': [40000],
+        'rate': [20000, 40000, 60000],
         'tx_size': 512,
-        'duration': 20,
+        'duration': 120,
         'runs': 1,
     }
     node_params = {
