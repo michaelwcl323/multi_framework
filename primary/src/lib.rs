@@ -1,20 +1,19 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 #[macro_use]
 mod error;
-mod aggregators;
-mod batch_waiter;
-mod certificate_waiter;
 mod core;
-mod garbage_collector;
-mod helper;
 mod messages;
+mod pbft;
 mod primary;
 mod proposer;
-mod synchronizer;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]
 mod common;
 
-pub use crate::messages::{Batch, Certificate, Transaction};
-pub use crate::primary::{Primary, Round};
+pub use crate::error::{PbftError, PbftResult};
+pub use crate::messages::{
+    leader, Batch, Commit, CommittedBatch, PbftMessage, Position, PrePrepare, Prepare, Sequence,
+    Transaction, SEQUENCE_WINDOW,
+};
+pub use crate::primary::Primary;

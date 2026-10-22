@@ -60,14 +60,13 @@ pub type WorkerId = u32;
 
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
-    /// The depth of the garbage collection (Denominated in number of rounds).
+    /// Number of recent decided sequence numbers to retain transport retries for.
     pub gc_depth: u64,
-    /// The delay after which the synchronizer retries to send sync requests. Denominated in ms.
+    /// Legacy compatibility field; unused by the PBFT normal path.
     pub sync_retry_delay: u64,
-    /// Determine with how many nodes to sync when re-trying to send sync-request. These nodes
-    /// are picked at random from the committee.
+    /// Legacy compatibility field; unused by the PBFT normal path.
     pub sync_retry_nodes: usize,
-    /// Preferred transaction-byte size of a complete DAG batch proposal.
+    /// Preferred transaction-byte size of a PBFT batch proposal.
     /// Denominated in bytes.
     pub batch_size: usize,
     /// The delay after which the proposer seals a batch, even if `batch_size`

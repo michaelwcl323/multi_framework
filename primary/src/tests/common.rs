@@ -1,64 +1,42 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Batch, Certificate, Vote};
-use bytes::Bytes;
+use crate::messages::{leader, Batch, Commit, CommittedBatch, Position, PrePrepare, Prepare};
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
-use crypto::Hash as _;
-use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
-use futures::sink::SinkExt as _;
-use futures::stream::StreamExt as _;
-use rand::rngs::StdRng;
-use rand::SeedableRng as _;
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use crypto::{generate_keypair, Hash as _, PublicKey, SecretKey, Signature};
+use rand::{rngs::StdRng, SeedableRng as _};
+use std::collections::HashMap;
 
-impl PartialEq for Batch {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl PartialEq for Vote {
-    fn eq(&self, other: &Self) -> bool {
-        self.digest() == other.digest()
-    }
-}
-
-// Fixture
 pub fn keys() -> Vec<(PublicKey, SecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
     (0..4).map(|_| generate_keypair(&mut rng)).collect()
 }
 
-// Fixture
 pub fn committee() -> Committee {
     Committee {
         authorities: keys()
             .iter()
             .enumerate()
-            .map(|(i, (id, _))| {
-                let primary = PrimaryAddresses {
-                    primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
-                    worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
-                };
-                let workers = vec![(
-                    0,
-                    WorkerAddresses {
-                        primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
-                        transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
-                        worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
-                    },
-                )]
-                .iter()
-                .cloned()
-                .collect();
+            .map(|(i, (name, _))| {
                 (
-                    *id,
+                    *name,
                     Authority {
                         stake: 1,
-                        primary,
-                        workers,
+                        primary: PrimaryAddresses {
+                            primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
+                            worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
+                        },
+                        workers: [(
+                            0,
+                            WorkerAddresses {
+                                primary_to_worker: format!("127.0.0.1:{}", 300 + i)
+                                    .parse()
+                                    .unwrap(),
+                                transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
+                                worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
+                            },
+                        )]
+                        .iter()
+                        .cloned()
+                        .collect::<HashMap<_, _>>(),
                     },
                 )
             })
@@ -66,119 +44,83 @@ pub fn committee() -> Committee {
     }
 }
 
-// Fixture.
-pub fn committee_with_base_port(base_port: u16) -> Committee {
+pub fn committee_with_base_port(base: u16) -> Committee {
     let mut committee = committee();
     for authority in committee.authorities.values_mut() {
         let primary = &mut authority.primary;
-
-        let port = primary.primary_to_primary.port();
-        primary.primary_to_primary.set_port(base_port + port);
-
-        let port = primary.worker_to_primary.port();
-        primary.worker_to_primary.set_port(base_port + port);
-
+        primary
+            .primary_to_primary
+            .set_port(base + primary.primary_to_primary.port());
+        primary
+            .worker_to_primary
+            .set_port(base + primary.worker_to_primary.port());
         for worker in authority.workers.values_mut() {
-            let port = worker.primary_to_worker.port();
-            worker.primary_to_worker.set_port(base_port + port);
-
-            let port = worker.transactions.port();
-            worker.transactions.set_port(base_port + port);
-
-            let port = worker.worker_to_worker.port();
-            worker.worker_to_worker.set_port(base_port + port);
+            worker
+                .primary_to_worker
+                .set_port(base + worker.primary_to_worker.port());
+            worker
+                .transactions
+                .set_port(base + worker.transactions.port());
+            worker
+                .worker_to_worker
+                .set_port(base + worker.worker_to_worker.port());
         }
     }
     committee
 }
 
-// Fixture
-pub fn batch() -> Batch {
-    let (author, secret) = keys().pop().unwrap();
-    let batch = Batch {
+pub fn proposal(sequence: u64, transactions: Vec<Vec<u8>>) -> PrePrepare {
+    let author = leader(&committee());
+    let (_, secret) = keys()
+        .into_iter()
+        .find(|(name, _)| *name == author)
+        .unwrap();
+    let mut proposal = PrePrepare {
+        position: Position::new(sequence),
+        batch: Batch::new(transactions),
         author,
-        round: 1,
-        transactions: vec![vec![0; 100], vec![1; 100]],
-        parents: Certificate::genesis(&committee())
-            .iter()
-            .map(|x| x.digest())
-            .collect(),
-        ..Batch::default()
+        signature: Signature::default(),
     };
-    Batch {
-        id: batch.digest(),
-        signature: Signature::new(&batch.digest(), &secret),
-        ..batch
-    }
+    proposal.signature = Signature::new(&proposal.digest(), &secret);
+    proposal
 }
 
-// Fixture
-pub fn batches() -> Vec<Batch> {
+pub fn prepares(proposal: &PrePrepare) -> Vec<Prepare> {
     keys()
         .into_iter()
         .map(|(author, secret)| {
-            let batch = Batch {
-                author,
-                round: 1,
-                parents: Certificate::genesis(&committee())
-                    .iter()
-                    .map(|x| x.digest())
-                    .collect(),
-                ..Batch::default()
-            };
-            Batch {
-                id: batch.digest(),
-                signature: Signature::new(&batch.digest(), &secret),
-                ..batch
-            }
-        })
-        .collect()
-}
-
-// Fixture
-pub fn votes(batch: &Batch) -> Vec<Vote> {
-    keys()
-        .into_iter()
-        .map(|(author, secret)| {
-            let vote = Vote {
-                id: batch.id.clone(),
-                round: batch.round,
-                origin: batch.author,
+            let mut vote = Prepare {
+                position: proposal.position,
+                proposal: proposal.digest(),
                 author,
                 signature: Signature::default(),
             };
-            Vote {
-                signature: Signature::new(&vote.digest(), &secret),
-                ..vote
-            }
+            vote.signature = Signature::new(&vote.digest(), &secret);
+            vote
         })
         .collect()
 }
 
-// Fixture
-pub fn certificate(batch: &Batch) -> Certificate {
-    Certificate {
-        batch: batch.clone(),
-        votes: votes(&batch)
-            .into_iter()
-            .map(|x| (x.author, x.signature))
-            .collect(),
-    }
+pub fn commits(proposal: &PrePrepare) -> Vec<Commit> {
+    keys()
+        .into_iter()
+        .map(|(author, secret)| {
+            let mut vote = Commit {
+                position: proposal.position,
+                proposal: proposal.digest(),
+                author,
+                signature: Signature::default(),
+            };
+            vote.signature = Signature::new(&vote.digest(), &secret);
+            vote
+        })
+        .collect()
 }
 
-// Fixture
-pub fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
-    tokio::spawn(async move {
-        let listener = TcpListener::bind(&address).await.unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let transport = Framed::new(socket, LengthDelimitedCodec::new());
-        let (mut writer, mut reader) = transport.split();
-        match reader.next().await {
-            Some(Ok(received)) => {
-                writer.send(Bytes::from("Ack")).await.unwrap();
-                received.freeze()
-            }
-            _ => panic!("Failed to receive network message"),
-        }
-    })
+pub fn decision(sequence: u64) -> CommittedBatch {
+    let proposal = proposal(sequence, vec![vec![sequence as u8; 10]]);
+    CommittedBatch {
+        commits: commits(&proposal).into_iter().take(3).collect(),
+        proposal,
+    }
 }

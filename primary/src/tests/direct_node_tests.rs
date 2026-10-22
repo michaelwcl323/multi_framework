@@ -1,5 +1,6 @@
 use super::*;
 use crate::common::{committee_with_base_port, keys};
+use crypto::Hash as _;
 use futures::SinkExt;
 use std::fs;
 use tokio::net::{TcpListener, TcpStream};
@@ -7,14 +8,21 @@ use tokio::time::{sleep, timeout, Duration};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[tokio::test]
-async fn three_of_four_nodes_certify_complete_batch_without_any_data_layer_ports() {
+async fn two_nodes_cannot_commit_then_third_node_completes_all_three_phases() {
     let committee = committee_with_base_port(16_000);
-    let owner = keys()[0].0;
+    let leader = leader(&committee);
+    let offline = *committee.authorities.keys().last().unwrap();
+    let mut live_keys: Vec<_> = keys()
+        .into_iter()
+        .filter(|(name, _)| *name != offline)
+        .collect();
+    live_keys.sort_by_key(|(name, _)| *name);
+    assert_eq!(live_keys[0].0, leader);
+    let third = live_keys.pop().unwrap();
+    let ingress = live_keys[1].0; // Exercise a backup's client forwarding path.
     let mut stores = Vec::new();
     let mut outputs = Vec::new();
-    let mut feedback = Vec::new();
     let mut unused_ports = Vec::new();
-    // Reserve every former worker port; complete nodes must not use them.
     for authority in committee.authorities.values() {
         for address in [
             authority.primary.worker_to_primary,
@@ -24,29 +32,27 @@ async fn three_of_four_nodes_certify_complete_batch_without_any_data_layer_ports
             unused_ports.push(TcpListener::bind(address).await.unwrap());
         }
     }
-    for (i, (name, secret)) in keys().into_iter().take(3).enumerate() {
-        let path = format!(".db_test_direct_node_{}", i);
+    let parameters = Parameters {
+        batch_size: 200,
+        max_batch_delay: 500,
+        ..Parameters::default()
+    };
+    for (i, (name, secret)) in live_keys.into_iter().enumerate() {
+        let path = format!(".db_test_pbft_node_{}", i);
         let _ = fs::remove_dir_all(&path);
         let store = Store::new(&path).unwrap();
-        let (tx_output, rx_output) = channel(100);
-        let (tx_feedback, rx_feedback) = channel(100);
+        let (tx, rx) = channel(100);
         Primary::spawn(
             KeyPair { name, secret },
             committee.clone(),
-            Parameters {
-                batch_size: 200,
-                max_batch_delay: 100,
-                ..Parameters::default()
-            },
+            parameters.clone(),
             store.clone(),
-            tx_output,
-            rx_feedback,
+            tx,
         );
         stores.push(store);
-        outputs.push(rx_output);
-        feedback.push(tx_feedback);
+        outputs.push(rx);
     }
-    let address = committee.worker(&owner, &0).unwrap().transactions;
+    let address = committee.worker(&ingress, &0).unwrap().transactions;
     let stream = timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(stream) = TcpStream::connect(address).await {
@@ -57,31 +63,58 @@ async fn three_of_four_nodes_certify_complete_batch_without_any_data_layer_ports
     })
     .await
     .unwrap();
-    let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+    let mut client = Framed::new(stream, LengthDelimitedCodec::new());
     let transactions = vec![vec![7_u8; 100], vec![8_u8; 100]];
     for tx in &transactions {
-        transport.send(Bytes::from(tx.clone())).await.unwrap();
+        client.send(Bytes::from(tx.clone())).await.unwrap();
     }
-    let certificate = timeout(Duration::from_secs(5), async {
-        loop {
-            let cert = outputs[0].recv().await.unwrap();
-            if cert.batch.author == owner && cert.batch.transactions == transactions {
-                break cert;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert!(certificate.verify(&committee).is_ok());
-    assert_eq!(certificate.votes.len(), 3);
-    // Every live node must have the full proposal available when it casts its vote.
-    for store in &mut stores {
-        let bytes = store
-            .read(certificate.batch.id.to_vec())
+    for output in &mut outputs {
+        assert!(
+            timeout(Duration::from_millis(150), output.recv())
+                .await
+                .is_err(),
+            "Two of four replicas must not commit"
+        );
+    }
+    let path = ".db_test_pbft_node_2";
+    let _ = fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+    let (tx, rx) = channel(100);
+    Primary::spawn(
+        KeyPair {
+            name: third.0,
+            secret: third.1,
+        },
+        committee.clone(),
+        parameters,
+        store.clone(),
+        tx,
+    );
+    stores.push(store);
+    outputs.push(rx);
+    let mut expected = None;
+    for output in &mut outputs {
+        let decision = timeout(Duration::from_secs(5), output.recv())
             .await
             .unwrap()
             .unwrap();
-        let batch: Batch = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(batch.transactions, transactions);
+        decision.verify(&committee).unwrap();
+        assert_eq!(decision.proposal.position.sequence, 1);
+        assert_eq!(decision.proposal.batch.transactions, transactions);
+        assert_eq!(decision.commits.len(), 3);
+        let digest = decision.proposal.digest();
+        if let Some(expected) = &expected {
+            assert_eq!(&digest, expected);
+        }
+        expected = Some(digest);
+    }
+    for store in &mut stores {
+        let bytes = store
+            .read(expected.clone().unwrap().to_vec())
+            .await
+            .unwrap()
+            .unwrap();
+        let proposal: crate::PrePrepare = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(proposal.batch.transactions, transactions);
     }
 }

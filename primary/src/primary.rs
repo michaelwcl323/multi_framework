@@ -1,36 +1,28 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_waiter::BatchWaiter;
-use crate::certificate_waiter::CertificateWaiter;
 use crate::core::Core;
-use crate::error::DagError;
-use crate::garbage_collector::GarbageCollector;
-use crate::helper::Helper;
-use crate::messages::{Batch, Certificate, Transaction, Vote};
+use crate::messages::{leader, CommittedBatch, PbftMessage, Transaction};
 use crate::proposer::Proposer;
-use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters};
-use crypto::{Digest, PublicKey, SignatureService};
+use crypto::SignatureService;
 use futures::SinkExt as _;
 use log::info;
-use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
+use network::{CancelHandler, MessageHandler, Receiver as NetworkReceiver, ReliableSender, Writer};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::net::SocketAddr;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::time::{interval, Duration};
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
-pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum PrimaryMessage {
-    Batch(Batch),
-    Vote(Vote),
-    Certificate(Certificate),
-    CertificatesRequest(Vec<Digest>, PublicKey),
+pub(crate) enum PrimaryMessage {
+    Pbft(PbftMessage),
+    Transaction(Transaction),
 }
 
 pub struct Primary;
@@ -45,21 +37,17 @@ impl Primary {
         committee: Committee,
         parameters: Parameters,
         store: Store,
-        tx_consensus: Sender<Certificate>,
-        rx_consensus: Receiver<Certificate>,
+        tx_consensus: Sender<CommittedBatch>,
     ) {
-        let (tx_transactions, rx_transactions) = channel(CHANNEL_CAPACITY);
-        let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
-        let (tx_batches, rx_batches) = channel(CHANNEL_CAPACITY);
-        let (tx_sync_batches, rx_sync_batches) = channel(CHANNEL_CAPACITY);
-        let (tx_sync_certificates, rx_sync_certificates) = channel(CHANNEL_CAPACITY);
-        let (tx_batches_loopback, rx_batches_loopback) = channel(CHANNEL_CAPACITY);
-        let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
-        let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
-        let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
-        parameters.log();
+        assert!(parameters.batch_size > 0, "Batch size must be positive");
         let name = keypair.name;
-        let consensus_round = Arc::new(AtomicU64::new(0));
+        assert!(committee.stake(&name) > 0, "Node has no voting rights");
+        let is_leader = name == leader(&committee);
+        let (tx_transactions, rx_transactions) = channel(CHANNEL_CAPACITY);
+        let (tx_messages, rx_messages) = channel(CHANNEL_CAPACITY);
+        let (tx_proposals, rx_proposals) = channel(CHANNEL_CAPACITY);
+        let (tx_committed, rx_committed) = channel(CHANNEL_CAPACITY);
+        parameters.log();
 
         let mut address = committee
             .primary(&name)
@@ -69,76 +57,83 @@ impl Primary {
         NetworkReceiver::spawn(
             address,
             PrimaryReceiverHandler {
-                tx_primary_messages,
-                tx_cert_requests,
+                tx_messages,
+                tx_transactions: if is_leader {
+                    Some(tx_transactions.clone())
+                } else {
+                    None
+                },
             },
         );
-
-        // Only the legacy client-ingress field is used; there is no worker or batch-data port.
         let mut transactions = committee
             .worker(&name, &0)
             .expect("Missing client endpoint")
             .transactions;
         transactions.set_ip("0.0.0.0".parse().unwrap());
         NetworkReceiver::spawn(transactions, TransactionReceiver { tx_transactions });
-
-        let synchronizer = Synchronizer::new(
-            name,
-            &committee,
-            store.clone(),
-            tx_sync_batches,
-            tx_sync_certificates,
-        );
-        let signature_service = SignatureService::new(keypair.secret);
+        let signatures = SignatureService::new(keypair.secret);
         Core::spawn(
             name,
             committee.clone(),
-            store.clone(),
-            synchronizer,
-            signature_service.clone(),
-            consensus_round.clone(),
+            store,
+            signatures.clone(),
             parameters.gc_depth,
-            rx_primary_messages,
-            rx_batches_loopback,
-            rx_certificates_loopback,
-            rx_batches,
+            rx_messages,
+            rx_proposals,
             tx_consensus,
-            tx_parents,
+            if is_leader { Some(tx_committed) } else { None },
         );
-        GarbageCollector::spawn(consensus_round.clone(), rx_consensus);
-        BatchWaiter::spawn(
-            name,
-            committee.clone(),
-            store.clone(),
-            consensus_round,
-            parameters.gc_depth,
-            parameters.sync_retry_delay,
-            parameters.sync_retry_nodes,
-            rx_sync_batches,
-            tx_batches_loopback,
+        if is_leader {
+            Proposer::spawn(
+                name,
+                signatures,
+                parameters.batch_size,
+                parameters.max_batch_delay,
+                rx_committed,
+                rx_transactions,
+                tx_proposals,
+            );
+        } else {
+            // Preserve one client endpoint per node. Backups forward client input
+            // once to the fixed leader; PBFT messages always use the common port.
+            let address = committee
+                .primary(&leader(&committee))
+                .unwrap()
+                .primary_to_primary;
+            tokio::spawn(forward_transactions(rx_transactions, address));
+        }
+        info!(
+            "Single-instance PBFT enabled: leader {}, epoch 0, instance 0, view 0",
+            leader(&committee)
         );
-        CertificateWaiter::spawn(
-            store.clone(),
-            rx_sync_certificates,
-            tx_certificates_loopback,
-        );
-        Proposer::spawn(
-            name,
-            &committee,
-            signature_service,
-            parameters.batch_size,
-            parameters.max_batch_delay,
-            rx_parents,
-            rx_transactions,
-            tx_batches,
-        );
-        Helper::spawn(committee.clone(), store, rx_cert_requests);
-        info!("Direct batch proposals enabled: transactions on {}, proposal/vote/certificate traffic on {}", transactions, address);
         info!(
             "Primary {} successfully booted on {}",
             name,
             committee.primary(&name).unwrap().primary_to_primary.ip()
         );
+    }
+}
+
+async fn forward_transactions(mut transactions: Receiver<Transaction>, address: SocketAddr) {
+    let mut network = ReliableSender::new();
+    let mut pending: HashMap<u64, CancelHandler> = HashMap::new();
+    let mut counter = 0;
+    let mut timer = interval(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            Some(transaction) = transactions.recv(), if pending.len() < CHANNEL_CAPACITY => {
+                let bytes = bincode::serialize(&PrimaryMessage::Transaction(transaction)).unwrap();
+                pending.insert(counter, network.send(address, Bytes::from(bytes)).await);
+                counter += 1;
+            }
+            _ = timer.tick() => {},
+        }
+        pending.retain(|_, handler| {
+            matches!(
+                handler.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
+        });
     }
 }
 
@@ -157,20 +152,22 @@ impl MessageHandler for TransactionReceiver {
 
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
-    tx_primary_messages: Sender<PrimaryMessage>,
-    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_messages: Sender<PbftMessage>,
+    tx_transactions: Option<Sender<Transaction>>,
 }
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
-    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            PrimaryMessage::CertificatesRequest(missing, requestor) => {
-                self.tx_cert_requests.send((missing, requestor)).await?;
+    async fn dispatch(&self, writer: &mut Writer, bytes: Bytes) -> Result<(), Box<dyn Error>> {
+        match bincode::deserialize(&bytes)? {
+            PrimaryMessage::Pbft(message) => self.tx_messages.send(message).await?,
+            PrimaryMessage::Transaction(transaction) => {
+                if let Some(tx) = &self.tx_transactions {
+                    tx.send(transaction).await?;
+                }
             }
-            request => self.tx_primary_messages.send(request).await?,
         }
-        // Transport ACKs only drive retries; proposal creation never waits for an ACK quorum.
+        // This ACK only acknowledges transport delivery, never a protocol vote.
         writer.send(Bytes::from_static(b"Ack")).await?;
         Ok(())
     }

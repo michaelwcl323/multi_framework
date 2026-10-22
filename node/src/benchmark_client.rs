@@ -17,7 +17,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Benchmark client for Narwhal and Tusk.")
+        .about("Benchmark client for single-instance PBFT.")
         .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
@@ -86,7 +86,7 @@ impl Client {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
+        // A tag and a 64-bit sample/request ID require at least nine bytes.
         if self.size < 9 {
             return Err(anyhow::Error::msg(
                 "Transaction size must be at least 9 bytes",
@@ -102,6 +102,9 @@ impl Client {
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
+        // Samples from different client endpoints may be batched by one leader.
+        // Keep their IDs distinct when logs are merged across nodes.
+        let sample_namespace = u64::from(rand::random::<u32>()) << 32;
         let mut r = rand::thread_rng().gen();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
         let interval = interval(Duration::from_millis(BURST_DURATION));
@@ -117,10 +120,11 @@ impl Client {
             for x in 0..burst {
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
+                    let sample = sample_namespace | counter;
+                    info!("Sending sample transaction {}", sample);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64(sample);
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.

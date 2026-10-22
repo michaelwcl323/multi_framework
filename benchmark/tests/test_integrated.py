@@ -93,6 +93,45 @@ class IntegratedBenchTests(unittest.TestCase):
             self.assertIn('1 (direct batch proposals)', parser.result())
             self.assertNotIn('Header size:', parser.result())
 
+    def test_pbft_matches_forwarded_samples_to_their_original_clients(self):
+        def line(seconds, text):
+            return f'[2026-10-21T00:00:{seconds}Z INFO test] {text}\n'
+
+        def client(sample, sent_at):
+            return ''.join([
+                line('00.000', 'Transactions size: 512 B'),
+                line('00.000', 'Transactions rate: 1000 tx/s'),
+                line('00.000', 'Start sending transactions'),
+                line(sent_at, f'Sending sample transaction {sample}'),
+            ])
+
+        common = ''.join(line('00.000', message) for message in [
+            'Garbage collection depth set to 50 rounds', 'Sync retry delay set to 1000 ms',
+            'Sync retry nodes set to 3 nodes', 'Batch size set to 500000 B',
+            'Max batch delay set to 200 ms', 'Primary key successfully booted on 127.0.0.1',
+            'Single-instance PBFT enabled: leader key, epoch 0, instance 0, view 0',
+        ])
+        leader = common + ''.join([
+            line('00.200', 'Batch abc= contains sample tx 4294967296'),
+            line('00.200', 'Batch abc= contains sample tx 8589934592'),
+            line('00.200', 'Batch abc= contains 1024 B'),
+            line('00.200', 'Created B1(key) -> abc='),
+            line('00.300', 'Batch pending= contains 512 B'),
+            line('00.300', 'Created B2(key) -> pending='),
+            line('00.600', 'Committed B1(key) -> abc='),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'primary-0.log').write_text(leader)
+            Path(directory, 'primary-1.log').write_text(common)
+            Path(directory, 'client-0-0.log').write_text(client(4294967296, '00.100'))
+            Path(directory, 'client-1-0.log').write_text(client(8589934592, '00.150'))
+            parser = LogParser.process(directory)
+            self.assertTrue(parser.pbft)
+            self.assertEqual(parser.sizes, {'abc=': 1024})
+            self.assertAlmostEqual(parser._end_to_end_latency(), 0.475, places=5)
+            self.assertIn('1 (single-instance PBFT)', parser.result())
+            self.assertNotIn('Header size:', parser.result())
+
 
 if __name__ == '__main__':
     unittest.main()

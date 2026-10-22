@@ -1,20 +1,21 @@
-# Direct batch DAG proposals
+# Single-instance PBFT
 
-The primary owns transaction ingress, batching, proposal dissemination, voting,
-parent synchronization, and certificate production in one process.
+`messages.rs` defines transaction batches, signed PrePrepare/Prepare/Commit
+messages, and locally emitted `CommittedBatch` proofs. `pbft.rs` is the
+deterministic state machine: it verifies messages, deduplicates senders, buffers
+early votes, and emits one Prepare, Commit, and decision per accepted slot.
 
-`Batch` contains `author`, `round`, full `transactions`, `parents`, `id`, and
-`signature`. The ID commits to transaction counts, transaction lengths and
-bytes, and the DAG metadata. `Vote` signs that proposal; `Certificate` contains
-the complete `Batch` plus quorum signatures. There is no separate `Header` or
-payload-digest map.
+`core.rs` executes those actions: it stores the complete proposal before
+preparing, stores local phase messages before broadcasting, feeds local votes
+through the same state machine, and persists decisions before output. These
+writes do not implement crash recovery. Transport ACKs are separate from votes.
 
-The proposer waits for the prior-round parent quorum, then seals a batch when
-transaction bytes reach `batch_size` or `max_batch_delay` expires. It broadcasts
-the full proposal immediately without any preliminary data-availability ACK
-quorum. Receivers verify the author/signature and parents, store the full batch,
-and then vote. The certificate drives the existing Tusk ordering code.
+`primary.rs` owns the common network port, client ingress, and backup-to-leader
+transaction forwarding. Only the fixed leader runs `proposer.rs`, which seals
+full/partial/empty batches and waits for its local decision before assigning the
+next sequence number. `consensus` verifies commit proofs and delivers only a
+contiguous sequence to the application; it does not run another voting phase.
 
-The batch waiter synchronizes missing parent certificates, which also contain
-their complete transaction payloads. The garbage collector receives committed
-rounds from Tusk; there are no worker cleanup messages or worker data ports.
+The fixed leader is the first committee key in sorted order; only epoch 0,
+instance 0, view 0 are supported. There is no DAG parent synchronization or
+Tusk ordering. See the root README for scope and validation commands.

@@ -15,8 +15,9 @@ class ParseError(Exception):
 
 class LogParser:
     def __init__(self, clients, primaries, workers, faults=0):
+        self.pbft = any('Single-instance PBFT enabled' in log for log in primaries)
         self.direct_batches = any('Direct batch proposals enabled' in log for log in primaries)
-        self.integrated = self.direct_batches or not workers or any('Integrated batch service' in log for log in primaries)
+        self.integrated = self.pbft or self.direct_batches or not workers or any('Integrated batch service' in log for log in primaries)
         if self.integrated:
             workers = primaries
         inputs = [clients, primaries, workers]
@@ -179,6 +180,16 @@ class LogParser:
         return tps, bps, duration
 
     def _end_to_end_latency(self):
+        if self.pbft:
+            # A backup's client input is proposed and logged by the fixed leader.
+            sent = {sample: timestamp for samples in self.sent_samples
+                    for sample, timestamp in samples.items()}
+            received = {sample: batch for samples in self.received_samples
+                        for sample, batch in samples.items()}
+            latency = [self.commits[batch] - sent[sample]
+                       for sample, batch in received.items()
+                       if sample in sent and batch in self.commits]
+            return mean(latency) if latency else 0
         latency = []
         for sent, received in zip(self.sent_samples, self.received_samples):
             for tx_id, batch_id in received.items():
@@ -204,6 +215,8 @@ class LogParser:
         end_to_end_latency = self._end_to_end_latency() * 1_000
 
         topology = (
+            ' Node processes per authority: 1 (single-instance PBFT)\n'
+            if self.pbft else
             ' Node processes per authority: 1 (direct batch proposals)\n'
             if self.direct_batches else
             ' Node processes per authority: 1 (integrated batching)\n'
@@ -212,7 +225,7 @@ class LogParser:
             f' Collocate primary and workers: {self.collocate}\n'
         )
 
-        header_config = '' if self.direct_batches else (
+        header_config = '' if self.pbft or self.direct_batches else (
             f' Header size: {header_size:,} B\n'
             f' Max header delay: {max_header_delay:,} ms\n'
         )

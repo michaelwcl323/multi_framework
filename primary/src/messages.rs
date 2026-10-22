@@ -1,12 +1,10 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::error::{DagError, DagResult};
-use crate::primary::Round;
+use crate::error::{PbftError, PbftResult};
 use config::Committee;
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use ed25519_dalek::{Digest as _, Sha512};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fmt;
 
@@ -15,243 +13,251 @@ use std::fmt;
 mod messages_tests;
 
 pub type Transaction = Vec<u8>;
+pub type Sequence = u64;
+/// Bounds slots and early votes retained before a proposal arrives.
+pub const SEQUENCE_WINDOW: Sequence = 128;
 
-#[derive(Clone, Serialize, Deserialize, Default)]
-pub struct Batch {
-    pub author: PublicKey,
-    pub round: Round,
-    pub transactions: Vec<Transaction>,
-    pub parents: BTreeSet<Digest>,
-    pub id: Digest,
-    pub signature: Signature,
+pub fn leader(committee: &Committee) -> PublicKey {
+    *committee
+        .authorities
+        .keys()
+        .next()
+        .expect("Empty committee")
 }
 
-impl Batch {
-    pub async fn new(
-        author: PublicKey,
-        round: Round,
-        transactions: Vec<Transaction>,
-        parents: BTreeSet<Digest>,
-        signature_service: &mut SignatureService,
-    ) -> Self {
-        let batch = Self {
-            author,
-            round,
-            transactions,
-            parents,
-            id: Digest::default(),
-            signature: Signature::default(),
-        };
-        let id = batch.digest();
-        let signature = signature_service.request_signature(id.clone()).await;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Position {
+    pub epoch: u64,
+    pub instance: u64,
+    pub view: u64,
+    pub sequence: Sequence,
+}
+
+impl Position {
+    pub fn new(sequence: Sequence) -> Self {
         Self {
-            id,
-            signature,
-            ..batch
+            epoch: 0,
+            instance: 0,
+            view: 0,
+            sequence,
         }
     }
 
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the batch id is well formed.
-        ensure!(self.digest() == self.id, DagError::InvalidBatchId);
+    pub fn verify(&self) -> PbftResult<()> {
+        ensure!(
+            self.epoch == 0 && self.instance == 0 && self.view == 0 && self.sequence > 0,
+            PbftError::UnsupportedPosition(*self)
+        );
+        Ok(())
+    }
 
-        // Ensure the authority has voting rights.
-        let voting_rights = committee.stake(&self.author);
-        ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author));
+    fn hash_into(&self, hasher: &mut Sha512) {
+        hasher.update(self.epoch.to_le_bytes());
+        hasher.update(self.instance.to_le_bytes());
+        hasher.update(self.view.to_le_bytes());
+        hasher.update(self.sequence.to_le_bytes());
+    }
+}
 
-        // Check the signature.
-        self.signature
-            .verify(&self.id, &self.author)
-            .map_err(DagError::from)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Batch {
+    pub transactions: Vec<Transaction>,
+    pub id: Digest,
+}
+
+impl Batch {
+    pub fn new(transactions: Vec<Transaction>) -> Self {
+        let mut batch = Self {
+            transactions,
+            id: Digest::default(),
+        };
+        batch.id = batch.digest();
+        batch
     }
 }
 
 impl Hash for Batch {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.author);
-        hasher.update(self.round.to_le_bytes());
+        hasher.update(b"iss/pbft/batch/v1");
         hasher.update((self.transactions.len() as u64).to_le_bytes());
         for transaction in &self.transactions {
             hasher.update((transaction.len() as u64).to_le_bytes());
             hasher.update(transaction);
         }
-        hasher.update((self.parents.len() as u64).to_le_bytes());
-        for x in &self.parents {
-            hasher.update(x);
-        }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
-impl fmt::Debug for Batch {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "{}: B{}({}, {})",
-            self.id,
-            self.round,
-            self.author,
-            self.transactions.iter().map(Vec::len).sum::<usize>(),
-        )
-    }
-}
-
-impl fmt::Display for Batch {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "B{}({})", self.round, self.author)
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Vote {
-    pub id: Digest,
-    pub round: Round,
-    pub origin: PublicKey,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrePrepare {
+    pub position: Position,
+    pub batch: Batch,
     pub author: PublicKey,
     pub signature: Signature,
 }
 
-impl Vote {
+impl PrePrepare {
     pub async fn new(
-        batch: &Batch,
-        author: &PublicKey,
-        signature_service: &mut SignatureService,
+        sequence: Sequence,
+        batch: Batch,
+        author: PublicKey,
+        signatures: &mut SignatureService,
     ) -> Self {
-        let vote = Self {
-            id: batch.id.clone(),
-            round: batch.round,
-            origin: batch.author,
-            author: *author,
+        let mut proposal = Self {
+            position: Position::new(sequence),
+            batch,
+            author,
             signature: Signature::default(),
         };
-        let signature = signature_service.request_signature(vote.digest()).await;
-        Self { signature, ..vote }
+        proposal.signature = signatures.request_signature(proposal.digest()).await;
+        proposal
     }
 
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
+    pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
+        self.position.verify()?;
         ensure!(
             committee.stake(&self.author) > 0,
-            DagError::UnknownAuthority(self.author)
+            PbftError::UnknownAuthority(self.author)
         );
-
-        // Check the signature.
-        self.signature
-            .verify(&self.digest(), &self.author)
-            .map_err(DagError::from)
+        ensure!(
+            self.author == leader(committee),
+            PbftError::UnexpectedLeader(self.author)
+        );
+        ensure!(
+            self.batch.id == self.batch.digest(),
+            PbftError::InvalidBatchId
+        );
+        self.signature.verify(&self.digest(), &self.author)?;
+        Ok(())
     }
 }
 
-impl Hash for Vote {
+impl Hash for PrePrepare {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.id);
-        hasher.update(self.round.to_le_bytes());
-        hasher.update(&self.origin);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        hasher.update(b"iss/pbft/preprepare/v1");
+        self.position.hash_into(&mut hasher);
+        hasher.update(self.author);
+        hasher.update(&self.batch.id);
+        Digest(hasher.finalize()[..32].try_into().unwrap())
     }
 }
 
-impl fmt::Debug for Vote {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "{}: V{}({}, {})",
-            self.digest(),
-            self.round,
-            self.author,
-            self.id
-        )
+impl fmt::Display for PrePrepare {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "B{}({})", self.position.sequence, self.author)
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
-pub struct Certificate {
-    pub batch: Batch,
-    pub votes: Vec<(PublicKey, Signature)>,
-}
-
-impl Certificate {
-    pub fn genesis(committee: &Committee) -> Vec<Self> {
-        committee
-            .authorities
-            .keys()
-            .map(|name| Self {
-                batch: Batch {
-                    author: *name,
-                    ..Batch::default()
-                },
-                ..Self::default()
-            })
-            .collect()
-    }
-
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Genesis certificates are always valid.
-        if Self::genesis(committee).contains(self) {
-            return Ok(());
+// Separate Rust types and signing domains prevent cross-phase signature replay.
+macro_rules! phase_message {
+    ($name:ident, $domain:expr) => {
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        pub struct $name {
+            pub position: Position,
+            pub proposal: Digest,
+            pub author: PublicKey,
+            pub signature: Signature,
         }
 
-        // Check the embedded batch.
-        self.batch.verify(committee)?;
+        impl $name {
+            pub async fn new(
+                proposal: &PrePrepare,
+                author: PublicKey,
+                signatures: &mut SignatureService,
+            ) -> Self {
+                let mut message = Self {
+                    position: proposal.position,
+                    proposal: proposal.digest(),
+                    author,
+                    signature: Signature::default(),
+                };
+                message.signature = signatures.request_signature(message.digest()).await;
+                message
+            }
 
-        // Ensure the certificate has a quorum.
-        let mut weight = 0;
+            pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
+                self.position.verify()?;
+                ensure!(
+                    committee.stake(&self.author) > 0,
+                    PbftError::UnknownAuthority(self.author)
+                );
+                self.signature.verify(&self.digest(), &self.author)?;
+                Ok(())
+            }
+        }
+
+        impl Hash for $name {
+            fn digest(&self) -> Digest {
+                let mut hasher = Sha512::new();
+                hasher.update($domain);
+                self.position.hash_into(&mut hasher);
+                hasher.update(&self.proposal);
+                hasher.update(&self.author);
+                Digest(hasher.finalize()[..32].try_into().unwrap())
+            }
+        }
+    };
+}
+
+phase_message!(Prepare, b"iss/pbft/prepare/v1");
+phase_message!(Commit, b"iss/pbft/commit/v1");
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PbftMessage {
+    PrePrepare(PrePrepare),
+    Prepare(Prepare),
+    Commit(Commit),
+}
+
+impl PbftMessage {
+    pub fn position(&self) -> Position {
+        match self {
+            Self::PrePrepare(x) => x.position,
+            Self::Prepare(x) => x.position,
+            Self::Commit(x) => x.position,
+        }
+    }
+
+    pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
+        match self {
+            Self::PrePrepare(x) => x.verify(committee),
+            Self::Prepare(x) => x.verify(committee),
+            Self::Commit(x) => x.verify(committee),
+        }
+    }
+}
+
+/// Local output, never an additional broadcast phase in the normal path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommittedBatch {
+    pub proposal: PrePrepare,
+    pub commits: Vec<Commit>,
+}
+
+impl CommittedBatch {
+    pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
+        self.proposal.verify(committee)?;
+        let digest = self.proposal.digest();
         let mut used = HashSet::new();
-        for (name, _) in self.votes.iter() {
-            ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
-            let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
-            used.insert(*name);
-            weight += voting_rights;
+        let mut weight = 0;
+        for commit in &self.commits {
+            commit.verify(committee)?;
+            ensure!(
+                commit.position == self.proposal.position && commit.proposal == digest,
+                PbftError::MismatchedCommit
+            );
+            ensure!(
+                used.insert(commit.author),
+                PbftError::AuthorityReuse(commit.author)
+            );
+            weight += committee.stake(&commit.author);
         }
         ensure!(
             weight >= committee.quorum_threshold(),
-            DagError::CertificateRequiresQuorum
+            PbftError::RequiresQuorum
         );
-
-        // Check the signatures.
-        Signature::verify_batch(&self.digest(), &self.votes).map_err(DagError::from)
-    }
-
-    pub fn round(&self) -> Round {
-        self.batch.round
-    }
-
-    pub fn origin(&self) -> PublicKey {
-        self.batch.author
-    }
-}
-
-impl Hash for Certificate {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(&self.batch.id);
-        hasher.update(self.round().to_le_bytes());
-        hasher.update(&self.origin());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for Certificate {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(
-            f,
-            "{}: C{}({}, {})",
-            self.digest(),
-            self.round(),
-            self.origin(),
-            self.batch.id
-        )
-    }
-}
-
-impl PartialEq for Certificate {
-    fn eq(&self, other: &Self) -> bool {
-        let mut ret = self.batch.id == other.batch.id;
-        ret &= self.round() == other.round();
-        ret &= self.origin() == other.origin();
-        ret
+        Ok(())
     }
 }

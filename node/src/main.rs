@@ -6,7 +6,7 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters};
 use consensus::Consensus;
 use env_logger::Env;
-use primary::{Certificate, Primary};
+use primary::{CommittedBatch, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 
@@ -17,7 +17,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 async fn main() -> Result<()> {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .about("Tusk ordering of complete batch proposals.")
+        .about("Single-instance PBFT ordering of complete batch proposals.")
         .args_from_usage("-v... 'Sets the level of verbosity'")
         .subcommand(
             SubCommand::with_name("generate_keys")
@@ -86,7 +86,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     for authority in committee.authorities.values() {
         anyhow::ensure!(
             authority.workers.len() == 1 && authority.workers.contains_key(&0),
-            "Direct-batch nodes require exactly one client endpoint (workers entry 0)"
+            "PBFT nodes require exactly one client endpoint (workers entry 0)"
         );
         let addresses = &authority.workers[&0];
         let host = authority.primary.primary_to_primary.ip();
@@ -99,30 +99,22 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
-    // Channels the sequence of certificates.
+    // Channels the sequence of committed PBFT batches.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
     // The primary command runs all authority tasks in this process.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
-            let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
-            let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+            let (tx_decisions, rx_decisions) = channel(CHANNEL_CAPACITY);
             Primary::spawn(
                 keypair,
                 committee.clone(),
                 parameters.clone(),
                 store.clone(),
-                /* tx_consensus */ tx_new_certificates,
-                /* rx_consensus */ rx_feedback,
+                tx_decisions,
             );
-            Consensus::spawn(
-                committee,
-                parameters.gc_depth,
-                /* rx_primary */ rx_new_certificates,
-                /* tx_primary */ tx_feedback,
-                tx_output,
-            );
+            Consensus::spawn(committee, rx_decisions, tx_output);
         }
 
         _ => unreachable!(),
@@ -135,9 +127,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     unreachable!();
 }
 
-/// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>) {
-    while let Some(_certificate) = rx_output.recv().await {
+/// Receives a contiguous sequence of committed PBFT batches.
+async fn analyze(mut rx_output: Receiver<CommittedBatch>) {
+    while let Some(_decision) = rx_output.recv().await {
         // NOTE: Here goes the application logic.
     }
 }
