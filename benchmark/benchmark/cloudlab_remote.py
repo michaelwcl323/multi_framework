@@ -6,6 +6,7 @@ This module provides functionality to run benchmarks on CloudLab nodes.
 """
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
@@ -724,12 +725,19 @@ class CloudLabBench:
         Print.info('Updating code on all nodes...')
         repo_name = self.settings.repo_name
         branch = self.settings.branch
+        quoted_branch = shlex.quote(branch)
+        remote_branch = shlex.quote(f'origin/{branch}')
+        branch_ref = shlex.quote(f'refs/heads/{branch}')
+        fetch_ref = shlex.quote(f'refs/heads/{branch}:refs/remotes/origin/{branch}')
         
         cmd = [
             f'cd {repo_name} || (echo "Repository {repo_name} not found. Please run: fab cloudlab-install" && exit 1)',
-            'git fetch',
-            f'git checkout {branch}',
-            'git pull',
+            # CloudLab clones may fetch only the original branch.
+            f'git fetch origin {fetch_ref}',
+            f'if git show-ref --verify --quiet {branch_ref}; then '
+            f'git checkout {quoted_branch}; else '
+            f'git checkout -b {quoted_branch} {remote_branch}; fi',
+            f'git merge --ff-only {remote_branch}',
             # Recover from corrupted rustup metadata (e.g. empty settings.toml).
             'if [ -f "$HOME/.rustup/settings.toml" ] && ! grep -q "^version" "$HOME/.rustup/settings.toml"; '
             'then echo "Detected corrupted rustup settings.toml; resetting it"; rm -f "$HOME/.rustup/settings.toml"; fi',
@@ -785,7 +793,9 @@ class CloudLabBench:
             for (username, port), hostnames in hosts_by_config.items():
                 conn_kwargs = self._get_connection_kwargs({})
                 g = Group(*hostnames, user=username, port=port, connect_kwargs=conn_kwargs, connect_timeout=60)
-                g.run(' && '.join(cmd), hide=True)
+                # Separate commands under errexit: a later optional `|| true`
+                # must not hide a failed fetch/checkout/build.
+                g.run('bash -lc ' + shlex.quote('set -e\n' + '\n'.join(cmd)), hide=True)
                 
                 # Modify attack.rs AFTER git operations (so the file exists)
                 if trigger_attack is not None:
@@ -1401,6 +1411,15 @@ SCRIPTEOF'''
         
         return None
     
+    def _background_run_parallel(self, jobs):
+        """Launch one phase concurrently and wait for every startup check."""
+        if not jobs:
+            return
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = [executor.submit(self._background_run, *job) for job in jobs]
+            for future in as_completed(futures):
+                future.result()
+
     def _run_single(self, rate, committee, bench_parameters, node_parameters, selected_hosts, debug=False):
         """Run a single benchmark iteration (CloudLab), mirroring logic from Bench._run_single"""
         from time import sleep
@@ -1419,12 +1438,13 @@ SCRIPTEOF'''
 
         # 2. Run the clients first (they will wait for the nodes to be ready)
         #    This mirrors benchmark/benchmark/remote.py::_run_single
-        Print.info('Booting clients...')
+        Print.info('Booting clients in parallel...')
         workers_total = committee.workers()
         rate_share = ceil(rate / workers_total)
         worker_rates = [rate_share] * workers_total
 
         worker_index = 0
+        client_jobs = []
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host_info = self._get_host_by_address(address, selected_hosts)
@@ -1440,11 +1460,13 @@ SCRIPTEOF'''
                     [x for y in workers_addresses for _, x in y]
                 )
                 log_file = PathMaker.client_log_file(i, id)
-                self._background_run(host_info, cmd, log_file)
+                client_jobs.append((host_info, cmd, log_file))
                 worker_index += 1
+        self._background_run_parallel(client_jobs)
 
         # 3. Run the primaries (except the faulty ones) – same order as Bench._run_single
-        Print.info('Booting primaries...')
+        Print.info('Booting primaries in parallel...')
+        primary_jobs = []
         for i, address in enumerate(committee.primary_addresses(faults)):
             host_info = self._get_host_by_address(address, selected_hosts)
             if not host_info:
@@ -1459,7 +1481,8 @@ SCRIPTEOF'''
                 debug=debug
             )
             log_file = PathMaker.primary_log_file(i)
-            self._background_run(host_info, cmd, log_file)
+            primary_jobs.append((host_info, cmd, log_file))
+        self._background_run_parallel(primary_jobs)
 
         # 5. Wait for all transactions to be processed (progress output)
         duration = bench_parameters.duration

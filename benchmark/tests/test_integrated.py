@@ -1,5 +1,6 @@
 """Checks for integrated-node topology and primary-only benchmark logs."""
 import tempfile
+from threading import Barrier, Lock
 import unittest
 from collections import OrderedDict
 from pathlib import Path
@@ -13,6 +14,48 @@ from benchmark.cloudlab_remote import CloudLabBench
 
 
 class IntegratedBenchTests(unittest.TestCase):
+    def test_cloudlab_launches_each_phase_concurrently_with_a_phase_barrier(self):
+        runner = CloudLabBench.__new__(CloudLabBench)
+        runner.kill = Mock()
+        hosts = [{'hostname': f'127.0.0.{i + 1}'} for i in range(4)]
+        committee = Committee(OrderedDict(
+            (f'node{i}', [host['hostname'], host['hostname']])
+            for i, host in enumerate(hosts)
+        ), 3000)
+        barriers = {'client': Barrier(4), 'primary': Barrier(4)}
+        lock = Lock()
+        completed = {'client': [], 'primary': []}
+
+        def launch(host, command, log_file):
+            phase = 'client' if 'client-' in log_file else 'primary'
+            if phase == 'primary':
+                with lock:
+                    self.assertEqual(len(completed['client']), 4)
+            # Serial execution cannot pass this barrier.
+            barriers[phase].wait(timeout=5)
+            with lock:
+                completed[phase].append(log_file)
+            if phase == 'client':
+                self.assertIn('--rate 1000', command)
+
+        runner._background_run = launch
+        with patch('benchmark.cloudlab_remote.sleep'):
+            runner._run_single(
+                4000, committee,
+                SimpleNamespace(faults=0, tx_size=512, duration=0),
+                None, hosts,
+            )
+        self.assertEqual(len(set(completed['client'])), 4)
+        self.assertEqual(len(set(completed['primary'])), 4)
+        self.assertEqual(runner.kill.call_count, 2)
+
+    def test_cloudlab_parallel_startup_propagates_failures(self):
+        runner = CloudLabBench.__new__(CloudLabBench)
+        runner._background_run = Mock(side_effect=RuntimeError('startup failed'))
+        with self.assertRaisesRegex(RuntimeError, 'startup failed'):
+            runner._background_run_parallel([({'hostname': 'node0'}, 'cmd', 'log')])
+        runner._background_run_parallel([])
+
     def test_segment_length_defaults_and_rejects_invalid_values(self):
         params = dict(gc_depth=50, sync_retry_delay=1000, sync_retry_nodes=3,
                       batch_size=2048000, max_batch_delay=200)
