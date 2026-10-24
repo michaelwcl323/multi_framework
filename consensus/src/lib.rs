@@ -26,7 +26,7 @@ struct GlobalOrder {
     epoch: Epoch,
     delivered: GlobalSequence,
     pending: BTreeMap<GlobalSequence, CommittedBatch>,
-    committed: BTreeMap<GlobalSequence, crypto::Digest>,
+    committed: BTreeMap<GlobalSequence, (bool, crypto::Digest)>,
 }
 
 impl GlobalOrder {
@@ -50,15 +50,17 @@ impl GlobalOrder {
         }
         let global = position.global_sequence(committee.size() as u64, self.epoch.length())?;
         if let Some(previous) = self.committed.get(&global) {
-            if *previous != decision.proposal.batch.id {
+            if *previous != (decision.proposal.bottom, decision.proposal.batch.id.clone()) {
                 return Err(PbftError::ConflictingGlobalDecision(global));
             }
             return Ok(());
         }
         // Retain verified current-epoch decisions even beyond the PBFT receive
         // window. Finite segment quotas bound the normal epoch's backlog.
-        self.committed
-            .insert(global, decision.proposal.batch.id.clone());
+        self.committed.insert(
+            global,
+            (decision.proposal.bottom, decision.proposal.batch.id.clone()),
+        );
         self.pending.insert(global, decision);
         Ok(())
     }
@@ -126,6 +128,11 @@ impl Consensus {
                 while let Some(ordered) = order.pop_next() {
                     let proposal = &ordered.committed.proposal;
                     let sn = ordered.global_sequence;
+                    if proposal.bottom {
+                        info!("Committed bottom epoch={} instance={} sequence={} view={} global_sn={}",
+                            proposal.position.epoch, proposal.position.instance,
+                            proposal.position.sequence, proposal.position.view, sn);
+                    }
                     debug!(
                         "Globally ordered {} -> {:?} (instance {}, global {}) epoch={}",
                         proposal,

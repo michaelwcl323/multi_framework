@@ -12,10 +12,11 @@ use crypto::{Hash as _, PublicKey, SignatureService};
 use log::{debug, info, warn};
 use network::CancelHandler;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::pin::Pin;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, sleep, Duration, Instant, Sleep};
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -38,6 +39,8 @@ pub(crate) struct Core {
     tx_proposer: Option<Sender<Position>>,
     network: Network,
     cancel_handlers: HashMap<GlobalSn, Vec<CancelHandler>>,
+    view_change_timeout: Duration,
+    view_change_timer: Option<Pin<Box<Sleep>>>,
 }
 
 impl Core {
@@ -51,12 +54,17 @@ impl Core {
         store: Store,
         signatures: SignatureService,
         gc_depth: Sequence,
+        view_change_timeout: u64,
         rx_messages: Receiver<PbftMessage>,
         rx_proposer: Receiver<PrePrepare>,
         tx_consensus: Sender<CommittedBatch>,
         tx_proposer: Option<Sender<Position>>,
         network: Network,
     ) -> watch::Receiver<(u64, u64)> {
+        assert!(
+            view_change_timeout > 0,
+            "View change timeout must be positive"
+        );
         let (tx_view, rx_view) = watch::channel((*rx_epoch.borrow(), 0));
         tokio::spawn(async move {
             let epoch = Epoch::new(*rx_epoch.borrow(), epoch_length, committee.size() as u64)
@@ -84,6 +92,12 @@ impl Core {
                 tx_proposer,
                 network,
                 cancel_handlers: HashMap::new(),
+                view_change_timeout: Duration::from_millis(view_change_timeout),
+                view_change_timer: if epoch.segment(instance).unwrap().slots > 0 {
+                    Some(Box::pin(sleep(Duration::from_millis(view_change_timeout))))
+                } else {
+                    None
+                },
             }
             .run()
             .await;
@@ -212,7 +226,8 @@ impl Core {
             &message,
             PbftMessage::ViewChange(_) | PbftMessage::NewView(_)
         );
-        let mut actions: VecDeque<_> = self.pbft.process(message.clone())?.into();
+        let before = self.timer_progress();
+        let actions = self.pbft.process(message.clone())?.into();
         self.record_recovery(&message);
         if changes_view {
             self.publish_view();
@@ -220,6 +235,14 @@ impl Core {
         if own_proposal {
             self.broadcast(message).await;
         }
+        let result = self.execute_actions(actions).await;
+        if before != self.timer_progress() {
+            self.reset_view_change_timer();
+        }
+        result
+    }
+
+    async fn execute_actions(&mut self, mut actions: VecDeque<Action>) -> PbftResult<()> {
         while let Some(action) = actions.pop_front() {
             let outgoing = match action {
                 Action::ChangeView(view) => {
@@ -243,8 +266,14 @@ impl Core {
                         == Some(self.name)
                     {
                         Some(PbftMessage::NewView(
-                            NewView::new(&self.committee, changes, self.name, &mut self.signatures)
-                                .await?,
+                            NewView::new(
+                                &self.committee,
+                                self.pbft.segment.slots,
+                                changes,
+                                self.name,
+                                &mut self.signatures,
+                            )
+                            .await?,
                         ))
                     } else {
                         None
@@ -321,10 +350,73 @@ impl Core {
         }
     }
 
+    fn timer_progress(&self) -> (u64, u64, Sequence) {
+        (
+            self.pbft.view,
+            self.pbft.target_view,
+            self.pbft.low_watermark,
+        )
+    }
+
+    fn reset_view_change_timer(&mut self) {
+        if self.pbft.is_complete() {
+            // Dropping Sleep deregisters the deadline, even while other
+            // instances still hold up this epoch's global-delivery barrier.
+            self.view_change_timer = None;
+        } else if let Some(timer) = &mut self.view_change_timer {
+            timer
+                .as_mut()
+                .reset(Instant::now() + self.view_change_timeout);
+        } else {
+            self.view_change_timer = Some(Box::pin(sleep(self.view_change_timeout)));
+        }
+    }
+
+    async fn on_view_change_timeout(&mut self) -> PbftResult<()> {
+        if self.pbft.is_complete() {
+            self.view_change_timer = None;
+            return Ok(());
+        }
+        let next_view = self
+            .pbft
+            .target_view
+            .checked_add(1)
+            .expect("View number exhausted");
+        warn!(
+            "PBFT timeout node={} epoch={} instance={} leader={} stalled_sequence={} target_view={}",
+            self.name, self.epoch.number, self.pbft.segment.instance,
+            crate::primary(&self.committee, self.pbft.segment.instance, self.pbft.target_view).unwrap(),
+            self.pbft.low_watermark, next_view
+        );
+        let result = self
+            .execute_actions(VecDeque::from(vec![Action::ChangeView(next_view)]))
+            .await;
+        self.reset_view_change_timer();
+        result
+    }
+
+    async fn wait_for_timeout(timer: &mut Option<Pin<Box<Sleep>>>) {
+        match timer {
+            Some(timer) => timer.as_mut().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
     fn record_recovery(&self, message: &PbftMessage) {
         #[cfg(feature = "benchmark")]
         if let PbftMessage::NewView(view) = message {
             for proposal in &view.proposals {
+                if proposal.bottom {
+                    info!(
+                        "Recovered bottom epoch={} instance={} view={} sequence={} global_sn={}",
+                        proposal.position.epoch,
+                        proposal.position.instance,
+                        proposal.position.view,
+                        proposal.position.sequence,
+                        self.epoch.global_sn(proposal.position).unwrap()
+                    );
+                    continue;
+                }
                 info!(
                     "Recovered {} -> {:?} origin_proposal={:?} epoch={} global_sn={}",
                     proposal,
@@ -388,6 +480,7 @@ impl Core {
                 let segment = self.epoch.segment(self.pbft.segment.instance).unwrap();
                 // Replacing PBFT drops the previous epoch's in-memory evidence.
                 self.pbft = Pbft::new(self.committee.clone(), segment);
+                self.reset_view_change_timer();
                 self.publish_view();
                 debug!(
                     "Started segment epoch={} instance={} slots={}",
@@ -418,12 +511,13 @@ impl Core {
                 }
             }
             let result = tokio::select! {
-                Some(message) = self.rx_messages.recv() => self.receive(message, false).await,
-                Some(proposal) = self.rx_proposer.recv() => self.receive(PbftMessage::PrePrepare(proposal), true).await,
                 changed = self.rx_epoch.changed() => {
                     if changed.is_err() { return; }
                     Ok(())
                 },
+                _ = Self::wait_for_timeout(&mut self.view_change_timer) => self.on_view_change_timeout().await,
+                Some(message) = self.rx_messages.recv() => self.receive(message, false).await,
+                Some(proposal) = self.rx_proposer.recv() => self.receive(PbftMessage::PrePrepare(proposal), true).await,
                 _ = cleanup_timer.tick() => Ok(()),
             };
             Self::report(result);

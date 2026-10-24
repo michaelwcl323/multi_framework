@@ -42,6 +42,10 @@ impl Primary {
         rx_epoch: watch::Receiver<u64>,
     ) {
         assert!(parameters.batch_size > 0, "Batch size must be positive");
+        assert!(
+            parameters.view_change_timeout > 0,
+            "View change timeout must be positive"
+        );
         let epoch_length = parameters
             .epoch_length(committee.size())
             .expect("Segment length must be positive and epoch length must fit u64");
@@ -73,6 +77,7 @@ impl Primary {
                 store.clone(),
                 signatures.clone(),
                 parameters.gc_depth,
+                parameters.view_change_timeout,
                 rx_messages,
                 rx_proposals,
                 tx_consensus.clone(),

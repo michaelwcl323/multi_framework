@@ -70,7 +70,7 @@ Signed `ViewChange` reports carry Prepared Evidence: the original proposal and a
 unique, stake-weighted Prepare quorum, optionally with a complete Commit quorum.
 A segment's new primary rotates with the view. A quorum of reports authorizes a
 signed `NewView`, which must recover the highest prepared view for each evidenced
-slot. Recovery retains the original sender's signature and the same batch and
+slot. Client-batch recovery retains the original sender's signature and the same batch and
 global SN. Old-view votes stop counting after a replica leaves that view, and
 committed values survive local slot cleanup and cannot be replaced or delivered
 twice. These messages and certificates are exposed by the `primary` crate.
@@ -83,10 +83,14 @@ restart; crash recovery is outside this step.
 Large recovery messages use authenticated fragments on the existing PBFT
 transport. Client transactions continue to feed their local proposer directly.
 
-This step supplies recovery state and authenticated message handling. Automatic
-timeouts, failure detection, bottom/no-op recovery for slots without evidence,
-request resurrection, checkpoints and restart state reconstruction are not
-implemented. Evidence-free holes remain undecided and can still block an epoch.
+Every Core monitors its own instance for lack of committed-prefix progress.
+`view_change_timeout` defaults to 60000 ms and is set in `benchmark/fabfile.py`.
+Expiry requests the next target view; completing a segment cancels its timer.
+NewView recovers prepared values and fills every evidence-free slot with an
+explicit, signed `bottom` no-op. Bottom requires normal Prepare/Commit quorums
+and occupies its global SN, allowing global delivery to cross those holes.
+Request resurrection, checkpoints and restart state reconstruction remain outside
+this step. All nodes must run the new message encoding together.
 See [view change state](docs/view-change-state.md) for the protocol boundaries,
 storage behavior and validation.
 

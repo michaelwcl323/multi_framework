@@ -35,10 +35,15 @@ fn report(
 }
 
 async fn build(changes: Vec<ViewChange>) -> NewView {
+    build_slots(25, changes).await
+}
+
+async fn build_slots(slots: u64, changes: Vec<ViewChange>) -> NewView {
     let primary = primary(&committee(), changes[0].instance, changes[0].view).unwrap();
     let (_, secret) = keys().into_iter().find(|(key, _)| *key == primary).unwrap();
     NewView::new(
         &committee(),
+        slots,
         changes,
         primary,
         &mut SignatureService::new(secret),
@@ -88,6 +93,131 @@ fn resign_new_view(view: &mut NewView) {
         .find(|(name, _)| *name == view.author)
         .unwrap();
     view.signature = Signature::new(&view.digest(), &secret);
+}
+
+#[tokio::test]
+async fn bottom_is_signed_distinct_from_empty_and_recoverable_without_sender_origin() {
+    let owner = primary(&committee(), 0, 1).unwrap();
+    let (_, secret) = keys().into_iter().find(|(name, _)| *name == owner).unwrap();
+    let mut signer = SignatureService::new(secret);
+    let normal = PrePrepare::recover(&proposal(1, vec![]), 1, owner, &mut signer).await;
+    let bottom = PrePrepare::new_bottom(normal.position, owner, &mut signer).await;
+    normal.verify(&committee()).unwrap();
+    bottom.verify(&committee()).unwrap();
+    assert_eq!(normal.batch.id, bottom.batch.id);
+    assert_ne!(normal.digest(), bottom.digest());
+    let mut tampered = bottom.clone();
+    tampered.bottom = false;
+    assert!(tampered.verify(&committee()).is_err());
+    let mut payload = bottom.clone();
+    payload.batch = crate::Batch::new(vec![vec![1]]);
+    payload.signature = signer.request_signature(payload.digest()).await;
+    assert!(matches!(
+        payload.verify(&committee()),
+        Err(PbftError::InvalidRecovery)
+    ));
+    let sender = crate::leader(&committee(), 0).unwrap();
+    let (_, secret) = keys()
+        .into_iter()
+        .find(|(name, _)| *name == sender)
+        .unwrap();
+    let initial =
+        PrePrepare::new_bottom(Position::new(1), sender, &mut SignatureService::new(secret)).await;
+    assert!(matches!(
+        initial.verify(&committee()),
+        Err(PbftError::InvalidRecovery)
+    ));
+    let next_owner = primary(&committee(), 0, 2).unwrap();
+    let (_, secret) = keys()
+        .into_iter()
+        .find(|(name, _)| *name == next_owner)
+        .unwrap();
+    let recovered =
+        PrePrepare::recover(&bottom, 2, next_owner, &mut SignatureService::new(secret)).await;
+    recovered.verify(&committee()).unwrap();
+    assert!(recovered.bottom && recovered.origin.is_none());
+    assert_eq!(recovered.position.slot(), bottom.position.slot());
+}
+
+#[tokio::test]
+async fn new_view_fills_all_holes_but_cannot_omit_invent_or_replace_a_slot() {
+    let prepared = proposal(2, vec![vec![7]]);
+    let view = build_slots(
+        3,
+        vec![
+            report(0, 0, 1, vec![certificate(prepared.clone(), false)]),
+            report(1, 0, 1, vec![]),
+            report(2, 0, 1, vec![]),
+        ],
+    )
+    .await;
+    view.verify(&committee()).unwrap();
+    assert_eq!(
+        view.proposals.iter().map(|p| p.bottom).collect::<Vec<_>>(),
+        vec![true, false, true]
+    );
+    assert_eq!(view.proposals[1].batch.id, prepared.batch.id);
+    let mut missing = view.clone();
+    missing.proposals.pop();
+    resign_new_view(&mut missing);
+    assert!(missing.verify(&committee()).is_err());
+    let mut duplicate = view.clone();
+    duplicate.proposals[2] = duplicate.proposals[0].clone();
+    resign_new_view(&mut duplicate);
+    assert!(duplicate.verify(&committee()).is_err());
+    let owner = view.author;
+    let (_, secret) = keys().into_iter().find(|(name, _)| *name == owner).unwrap();
+    let mut signer = SignatureService::new(secret);
+    let mut replaced = view.clone();
+    replaced.proposals[1] =
+        PrePrepare::new_bottom(replaced.proposals[1].position, owner, &mut signer).await;
+    resign_new_view(&mut replaced);
+    assert!(replaced.verify(&committee()).is_err());
+    let mut invented = view.clone();
+    invented.proposals[0] = PrePrepare::recover(&proposal(1, vec![]), 1, owner, &mut signer).await;
+    resign_new_view(&mut invented);
+    assert!(invented.verify(&committee()).is_err());
+    // A signed, internally consistent extent still has to match local config.
+    let shorter = build_slots(2, (0..3).map(|i| report(i, 0, 1, vec![])).collect()).await;
+    shorter.verify(&committee()).unwrap();
+    let mut local = Pbft::new(
+        committee(),
+        Epoch::new(0, 12, 4).unwrap().segment(0).unwrap(),
+    );
+    assert!(matches!(
+        local.process(PbftMessage::NewView(shorter)),
+        Err(PbftError::InvalidRecovery)
+    ));
+    assert_eq!(local.view, 0);
+    local.process(PbftMessage::NewView(view.clone())).unwrap();
+    for proposal in &view.proposals {
+        for vote in prepares(proposal).into_iter().take(3) {
+            local.process(PbftMessage::Prepare(vote)).unwrap();
+        }
+        for vote in commits(proposal).into_iter().take(3) {
+            local.process(PbftMessage::Commit(vote)).unwrap();
+        }
+    }
+    assert!(local.is_complete());
+    let evidence = local.begin_view_change(2).unwrap();
+    assert_eq!(evidence.len(), 3);
+    assert!(evidence
+        .iter()
+        .all(|proof| proof.verify(&committee()).is_ok() && proof.commits.len() == 3));
+    let next = build_slots(
+        3,
+        vec![
+            report(0, 0, 2, evidence),
+            report(1, 0, 2, vec![]),
+            report(2, 0, 2, vec![]),
+        ],
+    )
+    .await;
+    next.verify(&committee()).unwrap();
+    assert_eq!(
+        next.proposals.iter().map(|p| p.bottom).collect::<Vec<_>>(),
+        vec![true, false, true]
+    );
 }
 
 #[test]
@@ -187,20 +317,16 @@ async fn prepared_but_uncommitted_batch_is_recovered_and_commits_in_new_view() {
     ])
     .await;
     view.verify(&committee()).unwrap();
-    let recovered = &view.proposals[0];
+    let recovered = &view.proposals[4];
     assert_eq!(recovered.position.slot(), pp.position.slot());
     assert_eq!(recovered.position.view, 1);
     assert_eq!(recovered.batch.transactions, pp.batch.transactions);
     assert_ne!(recovered.author, pp.author);
     assert_eq!(recovered.position.global_sequence(4, 100).unwrap(), 20);
     let mut replica = state(3);
-    assert!(matches!(
-        replica
-            .process(PbftMessage::NewView(view.clone()))
-            .unwrap()
-            .as_slice(),
-        [Action::Prepare(_)]
-    ));
+    let actions = replica.process(PbftMessage::NewView(view.clone())).unwrap();
+    assert_eq!(actions.len(), 25);
+    assert!(actions.iter().all(|a| matches!(a, Action::Prepare(_))));
     for prepare in prepares(recovered).into_iter().take(3) {
         replica.process(PbftMessage::Prepare(prepare)).unwrap();
     }
@@ -238,9 +364,9 @@ async fn new_primary_cannot_replace_or_omit_prepared_batch_or_add_fresh_or_empty
             .find(|(name, _)| *name == view.author)
             .unwrap();
         let mut invalid = view.clone();
-        invalid.proposals[0] =
+        invalid.proposals[4] =
             PrePrepare::recover(&batch, 1, view.author, &mut SignatureService::new(secret)).await;
-        invalid.proposals[0].verify(&committee()).unwrap(); // Authentic origin still is not a safe selection.
+        invalid.proposals[4].verify(&committee()).unwrap(); // Authentic origin still is not a safe selection.
         resign_new_view(&mut invalid);
         assert!(invalid.verify(&committee()).is_err());
     }
@@ -263,7 +389,7 @@ async fn new_primary_cannot_replace_or_omit_prepared_batch_or_add_fresh_or_empty
         Err(PbftError::RequiresQuorum)
     ));
     let mut altered = view;
-    altered.proposals[0].origin = None;
+    altered.proposals[4].origin = None;
     resign_new_view(&mut altered);
     assert!(altered.verify(&committee()).is_err());
 }
@@ -311,13 +437,21 @@ async fn committed_history_survives_slot_cleanup_and_is_delivered_to_lagging_rep
         report(2, 0, 1, vec![]),
     ])
     .await;
-    assert!(replica
-        .process(PbftMessage::NewView(view.clone()))
-        .unwrap()
-        .is_empty());
+    let actions = replica.process(PbftMessage::NewView(view.clone())).unwrap();
+    assert_eq!(actions.len(), 24);
+    assert!(actions
+        .iter()
+        .all(|a| matches!(a, Action::Prepare(p) if p.bottom)));
     let mut lagging = state(0);
     let actions = lagging.process(PbftMessage::NewView(view.clone())).unwrap();
-    assert!(matches!(actions.as_slice(), [Action::Decide(_)]));
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a, Action::Decide(_)))
+            .count(),
+        1
+    );
+    assert_eq!(actions.len(), 25);
     assert_eq!(lagging.low_watermark, 2);
     assert!(lagging
         .process(PbftMessage::NewView(view))
@@ -362,7 +496,7 @@ async fn leaving_view_freezes_votes_and_late_messages_do_not_change_new_view() {
 }
 
 #[tokio::test]
-async fn view_change_is_segment_local_and_empty_report_does_not_invent_bottom_or_empty_batches() {
+async fn view_change_is_segment_local_and_empty_quorum_fills_explicit_bottoms() {
     let mut first = state(0);
     let mut other = state(1);
     assert!(first
@@ -375,7 +509,11 @@ async fn view_change_is_segment_local_and_empty_report_does_not_invent_bottom_or
         .unwrap();
     assert!(matches!(actions.as_slice(), [Action::ChangeView(1)]));
     let view = build((0..3).map(|i| report(i, 0, 1, vec![])).collect()).await;
-    assert!(view.proposals.is_empty());
+    assert_eq!(view.proposals.len(), 25);
+    assert!(view
+        .proposals
+        .iter()
+        .all(|p| p.bottom && p.batch.transactions.is_empty()));
     first.process(PbftMessage::NewView(view.clone())).unwrap();
     let name = primary(&committee(), 0, 1).unwrap();
     let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
@@ -448,10 +586,10 @@ async fn ten_equal_weight_authorities_require_seven_unique_view_changes() {
     let (_, secret) = keys.into_iter().find(|(name, _)| *name == primary).unwrap();
     let mut signer = SignatureService::new(secret);
     assert!(matches!(
-        NewView::new(&committee, reports[..6].to_vec(), primary, &mut signer).await,
+        NewView::new(&committee, 25, reports[..6].to_vec(), primary, &mut signer).await,
         Err(PbftError::RequiresQuorum)
     ));
-    let valid = NewView::new(&committee, reports[..7].to_vec(), primary, &mut signer)
+    let valid = NewView::new(&committee, 25, reports[..7].to_vec(), primary, &mut signer)
         .await
         .unwrap();
     valid.verify(&committee).unwrap();
@@ -502,11 +640,19 @@ async fn prepared_evidence_and_new_view_use_weighted_unique_quorums() {
     let (_, secret) = keys().into_iter().find(|(name, _)| *name == owner).unwrap();
     let mut signer = SignatureService::new(secret);
     assert!(matches!(
-        NewView::new(&weighted, vec![report(0, 0, 1, vec![])], owner, &mut signer).await,
+        NewView::new(
+            &weighted,
+            25,
+            vec![report(0, 0, 1, vec![])],
+            owner,
+            &mut signer
+        )
+        .await,
         Err(PbftError::RequiresQuorum)
     ));
     let valid = NewView::new(
         &weighted,
+        25,
         vec![report(0, 0, 1, vec![]), report(1, 0, 1, vec![])],
         owner,
         &mut signer,
@@ -517,6 +663,7 @@ async fn prepared_evidence_and_new_view_use_weighted_unique_quorums() {
     assert!(matches!(
         NewView::new(
             &weighted,
+            25,
             vec![report(0, 0, 1, vec![]), report(0, 0, 1, vec![])],
             owner,
             &mut signer
@@ -569,6 +716,7 @@ async fn committed_value_cannot_be_omitted_locally_or_displaced_by_newer_prepare
     assert!(matches!(
         NewView::new(
             &committee(),
+            25,
             reports,
             owner,
             &mut SignatureService::new(secret)

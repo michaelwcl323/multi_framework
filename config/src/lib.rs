@@ -63,6 +63,12 @@ pub struct Parameters {
     /// Number of entries assigned to each segment in an ISS epoch.
     #[serde(default = "default_segment_length")]
     pub segment_length: u64,
+    /// Maximum segment stall before requesting the next view, in milliseconds.
+    #[serde(
+        default = "default_view_change_timeout",
+        deserialize_with = "positive_timeout"
+    )]
+    pub view_change_timeout: u64,
     /// Number of recent decided sequence numbers to retain transport retries for.
     pub gc_depth: u64,
     /// Legacy compatibility field; unused by the PBFT normal path.
@@ -81,10 +87,25 @@ fn default_segment_length() -> u64 {
     25
 }
 
+fn default_view_change_timeout() -> u64 {
+    60_000
+}
+
+fn positive_timeout<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let timeout = u64::deserialize(deserializer)?;
+    if timeout == 0 {
+        return Err(serde::de::Error::custom(
+            "view_change_timeout must be positive",
+        ));
+    }
+    Ok(timeout)
+}
+
 impl Default for Parameters {
     fn default() -> Self {
         Self {
             segment_length: default_segment_length(),
+            view_change_timeout: default_view_change_timeout(),
             gc_depth: 50,
             sync_retry_delay: 5_000,
             sync_retry_nodes: 3,
@@ -106,6 +127,7 @@ impl Parameters {
 
     pub fn log(&self) {
         info!("Segment length set to {} entries", self.segment_length);
+        info!("View change timeout set to {} ms", self.view_change_timeout);
         info!("Garbage collection depth set to {} rounds", self.gc_depth);
         info!("Sync retry delay set to {} ms", self.sync_retry_delay);
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
@@ -290,6 +312,7 @@ mod tests {
         });
         let legacy: Parameters = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(legacy.segment_length, 25);
+        assert_eq!(legacy.view_change_timeout, 60_000);
         assert_eq!(legacy.epoch_length(4), Some(100));
         assert_eq!(legacy.epoch_length(10), Some(250));
         assert_eq!(legacy.epoch_length(0), None);
@@ -316,5 +339,25 @@ mod tests {
             .epoch_length(10),
             None
         );
+    }
+
+    #[test]
+    fn view_change_timeout_reads_milliseconds_and_rejects_invalid_values() {
+        let mut json = serde_json::json!({
+            "gc_depth": 50, "sync_retry_delay": 1000, "sync_retry_nodes": 3,
+            "batch_size": 2048000, "max_batch_delay": 200,
+            "view_change_timeout": 1234
+        });
+        let parameters: Parameters = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parameters.view_change_timeout, 1234);
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+        ] {
+            json["view_change_timeout"] = value;
+            assert!(serde_json::from_value::<Parameters>(json.clone()).is_err());
+        }
     }
 }

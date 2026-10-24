@@ -1,8 +1,7 @@
 //! Signed, segment-local recovery for finite epochs without checkpoints.
 //!
-//! Selection follows the highest prepared view in a quorum of reports. Slots
-//! without evidence stay undecided in this first stage; they are not converted
-//! into ordinary empty batches. A later SB-bottom phase can fill those holes.
+//! Selection follows the highest prepared view in a quorum of reports. Every
+//! remaining slot is filled with an explicitly signed bottom recovery proposal.
 use crate::{
     primary, Commit, CommittedBatch, Instance, PbftError, PbftResult, Position, PrePrepare,
     Prepare, Sequence,
@@ -135,6 +134,8 @@ pub struct NewView {
     pub epoch: u64,
     pub instance: Instance,
     pub view: u64,
+    /// Complete segment extent; receivers also bind it to their local layout.
+    pub slots: Sequence,
     pub changes: Vec<ViewChange>,
     pub proposals: Vec<PrePrepare>,
     pub author: PublicKey,
@@ -144,6 +145,7 @@ pub struct NewView {
 impl NewView {
     pub async fn new(
         committee: &Committee,
+        slots: Sequence,
         changes: Vec<ViewChange>,
         author: PublicKey,
         signatures: &mut SignatureService,
@@ -156,14 +158,33 @@ impl NewView {
             PbftError::UnexpectedLeader(author)
         );
         let selected = select(committee, epoch, instance, view, &changes)?;
+        ensure!(
+            selected.keys().all(|s| *s <= slots),
+            PbftError::InvalidRecovery
+        );
         let mut proposals = Vec::new();
-        for previous in selected.values() {
-            proposals.push(PrePrepare::recover(previous, view, author, signatures).await);
+        for sequence in 1..=slots {
+            proposals.push(if let Some(previous) = selected.get(&sequence) {
+                PrePrepare::recover(previous, view, author, signatures).await
+            } else {
+                PrePrepare::new_bottom(
+                    Position {
+                        epoch,
+                        instance,
+                        view,
+                        sequence,
+                    },
+                    author,
+                    signatures,
+                )
+                .await
+            });
         }
         let mut message = Self {
             epoch,
             instance,
             view,
+            slots,
             changes,
             proposals,
             author,
@@ -197,25 +218,29 @@ impl NewView {
             &self.changes,
         )?;
         ensure!(
-            selected.len() == self.proposals.len(),
+            self.slots == self.proposals.len() as u64,
             PbftError::InvalidRecovery
         );
+        let mut seen = HashSet::new();
         for proposal in &self.proposals {
             proposal.verify(committee)?;
             let position = proposal.position;
             ensure!(
                 position.epoch == self.epoch
                     && position.instance == self.instance
-                    && position.view == self.view,
+                    && position.view == self.view
+                    && position.sequence <= self.slots
+                    && seen.insert(position.sequence),
                 PbftError::InvalidRecovery
             );
-            let previous = selected
-                .remove(&position.sequence)
-                .ok_or(PbftError::InvalidRecovery)?;
-            ensure!(
-                previous.batch.id == proposal.batch.id,
-                PbftError::InvalidRecovery
-            );
+            if let Some(previous) = selected.remove(&position.sequence) {
+                ensure!(
+                    previous.batch.id == proposal.batch.id && previous.bottom == proposal.bottom,
+                    PbftError::InvalidRecovery
+                );
+            } else {
+                ensure!(proposal.bottom, PbftError::InvalidRecovery);
+            }
         }
         ensure!(selected.is_empty(), PbftError::InvalidRecovery);
         Ok(())
@@ -225,11 +250,12 @@ impl NewView {
 impl Hash for NewView {
     fn digest(&self) -> Digest {
         signed_digest(
-            b"iss/pbft/new-view/v1",
+            b"iss/pbft/new-view/v2",
             &(
                 self.epoch,
                 self.instance,
                 self.view,
+                self.slots,
                 &self.changes,
                 &self.proposals,
                 self.author,
@@ -282,14 +308,16 @@ fn select<'a>(
             let proposal = &certificate.proposal;
             let sequence = proposal.position.sequence;
             if !certificate.commits.is_empty() {
-                if let Some(previous) = committed.insert(sequence, proposal.batch.id.clone()) {
-                    ensure!(previous == proposal.batch.id, PbftError::InvalidRecovery);
+                let value = (proposal.bottom, proposal.batch.id.clone());
+                if let Some(previous) = committed.insert(sequence, value.clone()) {
+                    ensure!(previous == value, PbftError::InvalidRecovery);
                 }
             }
             if let Some(previous) = selected.get(&sequence) {
                 ensure!(
                     previous.position.view != proposal.position.view
-                        || previous.batch.id == proposal.batch.id,
+                        || (previous.batch.id == proposal.batch.id
+                            && previous.bottom == proposal.bottom),
                     PbftError::InvalidRecovery
                 );
                 if previous.position.view >= proposal.position.view {
@@ -303,9 +331,12 @@ fn select<'a>(
         weight >= committee.quorum_threshold(),
         PbftError::RequiresQuorum
     );
-    for (sequence, digest) in committed {
+    for (sequence, value) in committed {
         ensure!(
-            selected[&sequence].batch.id == digest,
+            (
+                selected[&sequence].bottom,
+                selected[&sequence].batch.id.clone()
+            ) == value,
             PbftError::InvalidRecovery
         );
     }

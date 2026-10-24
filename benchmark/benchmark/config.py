@@ -182,7 +182,11 @@ class NodeParameters:
         segment_length = json.get('segment_length', 25)
         if type(segment_length) is not int or segment_length <= 0:
             raise ConfigError('segment_length must be a positive integer')
-        self.json = dict(json, segment_length=segment_length)
+        view_change_timeout = json.get('view_change_timeout', 60000)
+        if type(view_change_timeout) is not int or view_change_timeout <= 0:
+            raise ConfigError('view_change_timeout must be a positive integer in ms')
+        self.json = dict(json, segment_length=segment_length,
+                         view_change_timeout=view_change_timeout)
         self.json.pop('epoch_length', None)
 
     def print(self, filename):

@@ -84,6 +84,7 @@ pub fn proposal_at(position: Position, transactions: Vec<Vec<u8>>) -> PrePrepare
         .find(|(name, _)| *name == author)
         .unwrap();
     let mut proposal = PrePrepare {
+        bottom: false,
         position,
         batch: Batch::new(transactions),
         author,

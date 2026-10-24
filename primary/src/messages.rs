@@ -152,6 +152,8 @@ impl Hash for Batch {
 pub struct PrePrepare {
     pub position: Position,
     pub batch: Batch,
+    /// A recovery no-op, distinct from an ordinary empty client batch.
+    pub bottom: bool,
     pub author: PublicKey,
     pub signature: Signature,
     /// Original SB sender's view-zero signature. Recovery never authorizes a
@@ -169,6 +171,24 @@ impl PrePrepare {
         let mut proposal = Self {
             position,
             batch,
+            bottom: false,
+            author,
+            signature: Signature::default(),
+            origin: None,
+        };
+        proposal.signature = signatures.request_signature(proposal.digest()).await;
+        proposal
+    }
+
+    pub async fn new_bottom(
+        position: Position,
+        author: PublicKey,
+        signatures: &mut SignatureService,
+    ) -> Self {
+        let mut proposal = Self {
+            position,
+            batch: Batch::new(Vec::new()),
+            bottom: true,
             author,
             signature: Signature::default(),
             origin: None,
@@ -189,21 +209,27 @@ impl PrePrepare {
                 ..previous.position
             },
             batch: previous.batch.clone(),
+            bottom: previous.bottom,
             author,
             signature: Signature::default(),
-            origin: Some(
-                previous
-                    .origin
-                    .as_ref()
-                    .unwrap_or(&previous.signature)
-                    .clone(),
-            ),
+            origin: if previous.bottom {
+                None
+            } else {
+                Some(
+                    previous
+                        .origin
+                        .as_ref()
+                        .unwrap_or(&previous.signature)
+                        .clone(),
+                )
+            },
         };
         proposal.signature = signatures.request_signature(proposal.digest()).await;
         proposal
     }
 
     pub fn original_digest(&self, committee: &Committee) -> PbftResult<Digest> {
+        ensure!(!self.bottom, PbftError::InvalidRecovery);
         let sender = leader(committee, self.position.instance)
             .ok_or(PbftError::UnknownInstance(self.position.instance))?;
         Ok(proposal_digest(
@@ -213,6 +239,7 @@ impl PrePrepare {
             },
             sender,
             &self.batch.id,
+            false,
         ))
     }
 
@@ -231,7 +258,14 @@ impl PrePrepare {
             PbftError::InvalidBatchId
         );
         self.signature.verify(&self.digest(), &self.author)?;
-        if self.position.view == 0 {
+        if self.bottom {
+            ensure!(
+                self.position.view > 0
+                    && self.batch.transactions.is_empty()
+                    && self.origin.is_none(),
+                PbftError::InvalidRecovery
+            );
+        } else if self.position.view == 0 {
             ensure!(self.origin.is_none(), PbftError::InvalidRecovery);
         } else {
             let sender = leader(committee, self.position.instance).unwrap();
@@ -243,6 +277,7 @@ impl PrePrepare {
                 },
                 sender,
                 &self.batch.id,
+                false,
             );
             origin.verify(&digest, &sender)?;
         }
@@ -252,16 +287,17 @@ impl PrePrepare {
 
 impl Hash for PrePrepare {
     fn digest(&self) -> Digest {
-        proposal_digest(self.position, self.author, &self.batch.id)
+        proposal_digest(self.position, self.author, &self.batch.id, self.bottom)
     }
 }
 
-fn proposal_digest(position: Position, author: PublicKey, batch: &Digest) -> Digest {
+fn proposal_digest(position: Position, author: PublicKey, batch: &Digest, bottom: bool) -> Digest {
     let mut hasher = Sha512::new();
-    hasher.update(b"iss/pbft/preprepare/v1");
+    hasher.update(b"iss/pbft/preprepare/v2");
     position.hash_into(&mut hasher);
     hasher.update(author);
     hasher.update(batch);
+    hasher.update([u8::from(bottom)]);
     Digest(hasher.finalize()[..32].try_into().unwrap())
 }
 

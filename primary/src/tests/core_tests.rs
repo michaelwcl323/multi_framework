@@ -20,6 +20,128 @@ fn evidence_key(prefix: &[u8], position: Position) -> PbftResult<Vec<u8>> {
     Ok(key)
 }
 
+fn timer_core(path: &str, port: u16) -> (Core, watch::Sender<u64>, Receiver<CommittedBatch>) {
+    let committee = committee_with_base_port(port);
+    let name = crate::leader(&committee, 1).unwrap();
+    let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
+    let _ = fs::remove_dir_all(path);
+    let (tx_epoch, rx_epoch) = watch::channel(0);
+    let (tx_view, _) = watch::channel((0, 0));
+    let (_, rx_messages) = channel(32);
+    let (_, rx_proposer) = channel(32);
+    let (tx_consensus, output) = channel(32);
+    let epoch = Epoch::new(0, 8, 4).unwrap();
+    let core = Core {
+        name,
+        store: Store::new(path).unwrap(),
+        signatures: SignatureService::new(secret),
+        pbft: Pbft::new(committee.clone(), epoch.segment(0).unwrap()),
+        network: Network::spawn(name, &committee),
+        committee,
+        epoch,
+        rx_epoch,
+        future_messages: BTreeMap::new(),
+        tx_view,
+        gc_depth: 50,
+        rx_messages,
+        rx_proposer,
+        tx_consensus,
+        tx_proposer: None,
+        cancel_handlers: HashMap::new(),
+        view_change_timeout: Duration::from_millis(60_000),
+        view_change_timer: Some(Box::pin(sleep(Duration::from_millis(60_000)))),
+    };
+    (core, tx_epoch, output)
+}
+
+#[tokio::test(start_paused = true)]
+async fn timer_fires_without_messages_retries_next_target_and_rearms_for_new_epoch() {
+    let (mut core, epoch, _output) = timer_core(".db_test_timeout_automatic", 25_000);
+    let mut progress = core.tx_view.subscribe();
+    let task = tokio::spawn(async move { core.run().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(59_999)).await;
+    assert_eq!(*progress.borrow_and_update(), (0, 0));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    progress.changed().await.unwrap();
+    assert_eq!(*progress.borrow_and_update(), (0, 1));
+    tokio::time::advance(Duration::from_millis(60_000)).await;
+    progress.changed().await.unwrap();
+    assert_eq!(*progress.borrow_and_update(), (0, 2));
+    epoch.send(1).unwrap();
+    progress.changed().await.unwrap();
+    assert_eq!(*progress.borrow_and_update(), (1, 0));
+    tokio::time::advance(Duration::from_millis(59_999)).await;
+    assert_eq!(*progress.borrow_and_update(), (1, 0));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    progress.changed().await.unwrap();
+    assert_eq!(*progress.borrow_and_update(), (1, 1));
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_and_invalid_messages_do_not_postpone_stall_timeout() {
+    let (mut core, _epoch, _output) = timer_core(".db_test_timeout_duplicates", 26_000);
+    let deadline = core.view_change_timer.as_ref().unwrap().deadline();
+    let pp = proposal(1, vec![vec![7]]);
+    core.process(PbftMessage::PrePrepare(pp.clone()), false)
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(59_000)).await;
+    core.process(PbftMessage::PrePrepare(pp.clone()), false)
+        .await
+        .unwrap();
+    let mut invalid = pp;
+    invalid.signature = crypto::Signature::default();
+    assert!(core
+        .process(PbftMessage::PrePrepare(invalid), false)
+        .await
+        .is_err());
+    assert_eq!(
+        core.view_change_timer.as_ref().unwrap().deadline(),
+        deadline
+    );
+    tokio::time::advance(Duration::from_millis(1000)).await;
+    core.on_view_change_timeout().await.unwrap();
+    assert_eq!(core.pbft.target_view, 1);
+    assert_eq!(core.pbft.view, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_prefix_resets_timeout_and_completed_segment_cancels_it() {
+    let (mut core, _epoch, mut output) = timer_core(".db_test_timeout_complete", 27_000);
+    tokio::time::advance(Duration::from_millis(50_000)).await;
+    for sequence in 1..=2 {
+        let pp = proposal(sequence, vec![vec![7]]);
+        core.process(PbftMessage::PrePrepare(pp.clone()), false)
+            .await
+            .unwrap();
+        for vote in prepares(&pp).into_iter().take(3) {
+            core.process(PbftMessage::Prepare(vote), false)
+                .await
+                .unwrap();
+        }
+        for vote in commits(&pp).into_iter().take(3) {
+            core.process(PbftMessage::Commit(vote), false)
+                .await
+                .unwrap();
+        }
+        output.try_recv().unwrap().verify(&core.committee).unwrap();
+        if sequence == 1 {
+            assert_eq!(
+                core.view_change_timer.as_ref().unwrap().deadline(),
+                Instant::now() + Duration::from_millis(60_000)
+            );
+            tokio::time::advance(Duration::from_millis(20_000)).await;
+        }
+    }
+    assert!(core.pbft.is_complete());
+    assert!(core.view_change_timer.is_none());
+    tokio::time::advance(Duration::from_millis(120_000)).await;
+    core.on_view_change_timeout().await.unwrap();
+    assert_eq!(core.pbft.target_view, 0);
+}
+
 #[async_trait]
 impl MessageHandler for Observer {
     async fn dispatch(&self, writer: &mut Writer, bytes: Bytes) -> Result<(), Box<dyn Error>> {
@@ -59,6 +181,7 @@ async fn backup_broadcasts_prepare_and_commit_to_every_other_replica() {
         store.clone(),
         SignatureService::new(secret),
         50,
+        60_000,
         rx,
         rx_proposer,
         tx_output,
@@ -171,6 +294,7 @@ async fn future_epoch_messages_wait_for_barrier_then_replay_once() {
         store.clone(),
         SignatureService::new(secret),
         50,
+        60_000,
         rx,
         rx_proposer,
         tx_output,
@@ -294,6 +418,7 @@ async fn segment_primary_builds_new_view_and_replays_votes_that_arrive_before_it
         Store::new(path).unwrap(),
         SignatureService::new(secret),
         50,
+        60_000,
         rx,
         rx_proposer,
         tx_output,
@@ -371,7 +496,7 @@ async fn segment_primary_builds_new_view_and_replays_votes_that_arrive_before_it
         .await
         .unwrap();
         view.verify(&committee).unwrap();
-        assert_eq!(view.proposals.len(), 1);
+        assert_eq!(view.proposals.len(), 25);
     }
     // Old-view commits cannot emit a second decision.
     for commit in commits(&original) {
@@ -420,6 +545,7 @@ async fn lagging_core_retains_imported_commit_evidence_in_memory_for_the_next_vi
     let (_, signer) = keys().into_iter().find(|(key, _)| *key == primary).unwrap();
     let view = NewView::new(
         &committee,
+        3,
         reports,
         primary,
         &mut SignatureService::new(signer),
@@ -437,11 +563,12 @@ async fn lagging_core_retains_imported_commit_evidence_in_memory_for_the_next_vi
         name,
         committee.clone(),
         0,
-        1000,
+        12,
         rx_epoch,
         store.clone(),
         SignatureService::new(secret),
         50,
+        60_000,
         rx,
         rx_proposer,
         tx_output,

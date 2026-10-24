@@ -16,12 +16,21 @@ The raw transaction input and finite-epoch delivery barrier are retained.
   Reports must have unique authors and a stake-weighted quorum for one target.
 - Selection recovers the highest prepared view for each reported slot, rejects
   conflicting values in the same prepared view, and preserves complete Commit
-  proofs. The proposed recovery set must match selection exactly: no omissions,
-  replacements, fresh values, or invented empty batches.
-- A recovered `PrePrepare` has the new view and primary signature, plus the
+  proofs. NewView covers every slot in its finite segment: it recovers selected
+  evidence and generates explicit bottom proposals for all remaining slots.
+  Duplicate/missing slots, substituted prepared values, fresh client batches and
+  ordinary empty batches in place of bottom are rejected. The signed `slots`
+  extent must match each receiver's local epoch layout.
+- A recovered client-batch `PrePrepare` has the new view and primary signature, plus the
   original sender's view-zero signature over the same batch/slot. Recovery
   cannot authorize a new client batch, even when primary rotation returns to
   the original sender.
+- `PrePrepare.bottom` distinguishes a recovery no-op from an ordinary empty batch.
+  It is bound into the proposal digest/signature. Bottom requires a nonzero view,
+  an empty payload and no original-sender signature. Only the installed NewView's
+  authorized proposal set can receive normal-path votes. Prepared/committed
+  bottom evidence can be recovered in later views; value identity includes the
+  bottom flag during selection, local committed checks and global deduplication.
 - `SlotKey { epoch, instance, sequence }` and global SN do not change with view.
   Votes remain bound to the full position including view. Global Ordering treats
   valid old/new-view proofs for the same batch as idempotent and rejects a
@@ -46,6 +55,31 @@ after leaving view zero. Each new epoch starts fresh at view zero. Authenticated
 future-view votes are buffered, do not vote before NewView installation, and
 are replayed when the installed view changes. Step 5's immediately-next-epoch
 lookahead remains bounded; buffers are not rescanned on every normal message.
+
+## Local timeout
+
+`view_change_timeout` is configured in `benchmark/fabfile.py`, written into node
+parameters by Python `NodeParameters`, deserialized by Rust `Parameters` and
+passed to every instance's Core. It defaults to **60000 milliseconds** and must
+be a positive integer. Old parameter files use the default.
+
+Each Core owns a local timer for its current epoch/instance. It suspects a stall
+when its contiguous committed prefix makes no progress during this interval;
+this is a local failure detector, not proof of leader misbehavior. A new proposal,
+duplicate vote, invalid message or future-view buffered message does not extend
+the deadline. Advancing the committed prefix or entering/installing a view resets
+it. Expiry executes `Action::ChangeView(target_view + 1)`, freezes old-view voting,
+and signs/broadcasts local in-memory evidence. If no NewView makes progress, the
+timer retries the next target view after another configured interval.
+
+Completing the segment drops/cancels its timer, even while other instances block
+the global epoch barrier. A new local epoch starts a fresh timer at view zero;
+zero-slot segments never arm one. The normal path reuses a pinned Sleep and only
+resets it on progress; timeout handling introduces no Prepared database writes.
+
+Bottom proposals pass through the same Prepare/Commit quorums as recovered
+client batches. They occupy their global SN and are delivered with `bottom=true`
+and no transactions, allowing Global Ordering and the epoch barrier to advance.
 
 ## Storage and transport
 
@@ -73,17 +107,16 @@ sender/segment/phase, then validated as full protocol messages. Duplicate
 fragments/messages do not deliver twice. The control-message limit is 512 MiB.
 Normal PrePrepare/Prepare/Commit use the existing broadcast path.
 
-The message encoding adds variants and original-signature metadata. Deploy a
-homogeneous build; interoperability with Step 5 binaries is not provided.
+The message encoding and signing domains include bottom and the NewView extent.
+Deploy a homogeneous build; interoperability with earlier binaries is not provided.
 
 ## Scope and validation
 
-Initiation uses explicitly constructed authenticated ViewChange reports; this
-step adds no timeout loop, failure detector, or admin RPC. Receiving sufficient
-valid reports joins the requested view automatically. A slot without Prepared
-Evidence remains undecided, so an evidence-free segment can remain blocked.
-Bottom/no-op selection, transaction resurrection, checkpoints, state transfer,
-and crash/restart recovery are separate work.
+Local timeouts and sufficient authenticated reports initiate/join view changes
+automatically. Bottom fills evidence-free slots in an authorized NewView.
+Transaction resurrection, checkpoints, state transfer, crash/restart recovery
+and an admin RPC remain outside this step. Unprepared client requests are not
+automatically resurrected when their original slot becomes bottom.
 
 Tests cover weighted/unique quorums, signature and context tampering, highest
 prepared selection across multiple views, committed-value protection after
@@ -95,10 +128,16 @@ transport of ViewChange and NewView larger than 8 MiB. Existing normal-path
 PBFT/epoch tests remain part of the workspace suite. Benchmark parsing maps
 recovered digests to their original proposal time and client samples.
 
-The in-memory evidence revision passed **78 Rust tests**, default-feature
-compilation, formatting and whitespace checks. The former RocksDB Prepared
-loader/deletion tests were removed; coverage now exercises actual retained
-evidence, shared payload ownership and epoch retirement.
+Additional timeout/bottom coverage uses a paused Tokio clock for autonomous
+expiry, repeated target views, unchanged deadlines for duplicate/invalid traffic,
+progress resets, completed-segment cancellation and epoch rearming. Real TCP
+integration keeps one of four leaders offline while the other three nodes use
+bottom to deliver two identical complete epochs. Bottom tampering, incomplete
+NewView extents, prepared-value preservation and normal-empty/bottom conflicts
+are also checked.
+
+This revision passed **86 Rust tests and 9 Python tests**, default-feature
+workspace compilation, formatting and whitespace checks.
 
 Validation commands (functional checks, not performance measurements):
 

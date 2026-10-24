@@ -255,7 +255,7 @@ async fn recovery_larger_than_transport_frame_reaches_all_peers_with_full_eviden
             .await,
         );
     }
-    let new_view = crate::NewView::new(&committee, reports, name, &mut signatures)
+    let new_view = crate::NewView::new(&committee, 2, reports, name, &mut signatures)
         .await
         .unwrap();
     let message = PbftMessage::NewView(new_view);

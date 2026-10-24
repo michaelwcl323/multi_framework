@@ -70,6 +70,10 @@ pub(crate) struct Pbft {
 }
 
 impl Pbft {
+    pub fn is_complete(&self) -> bool {
+        self.low_watermark > self.segment.slots
+    }
+
     pub fn new(committee: Committee, segment: Segment) -> Self {
         let instance = segment.instance;
         assert!(
@@ -361,6 +365,10 @@ impl Pbft {
 
     fn install_view(&mut self, new_view: NewView) -> PbftResult<Vec<Action>> {
         new_view.verify(&self.committee)?;
+        ensure!(
+            new_view.slots == self.segment.slots,
+            PbftError::InvalidRecovery
+        );
         for change in &new_view.changes {
             self.check_report(change)?;
         }
@@ -382,8 +390,8 @@ impl Pbft {
         for (sequence, certificate) in &self.history {
             if !certificate.commits.is_empty() {
                 ensure!(
-                    selected.get(sequence).map(|p| &p.batch.id)
-                        == Some(&certificate.proposal.batch.id),
+                    selected.get(sequence).map(|p| (p.bottom, &p.batch.id))
+                        == Some((certificate.proposal.bottom, &certificate.proposal.batch.id)),
                     PbftError::InvalidRecovery
                 );
             }

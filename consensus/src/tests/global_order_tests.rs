@@ -12,6 +12,52 @@ fn new_order() -> GlobalOrder {
     GlobalOrder::new(Epoch::new(0, 12, 4).unwrap())
 }
 
+#[tokio::test]
+async fn bottom_fills_global_hole_but_cannot_alias_an_ordinary_empty_batch() {
+    let (committee, mut signers) = setup();
+    let normal = decision(&committee, &mut signers, 0, 1, vec![]).await;
+    let later = decision(&committee, &mut signers, 1, 1, vec![vec![7]]).await;
+    let owner = primary::primary(&committee, 0, 1).unwrap();
+    let (_, signatures) = signers.iter_mut().find(|(name, _)| *name == owner).unwrap();
+    let proposal = PrePrepare::new_bottom(
+        Position {
+            view: 1,
+            ..normal.proposal.position
+        },
+        owner,
+        signatures,
+    )
+    .await;
+    let mut votes = Vec::new();
+    for (name, signatures) in signers.iter_mut().take(3) {
+        votes.push(Commit::new(&proposal, *name, signatures).await);
+    }
+    let bottom = CommittedBatch {
+        proposal,
+        commits: votes,
+    };
+    bottom.verify(&committee).unwrap();
+    assert_eq!(normal.proposal.batch.id, bottom.proposal.batch.id);
+    let mut order = new_order();
+    order.insert(&committee, later).unwrap();
+    assert!(order.pop_next().is_none());
+    order.insert(&committee, bottom.clone()).unwrap();
+    assert!(order.pop_next().unwrap().committed.proposal.bottom);
+    assert_eq!(order.pop_next().unwrap().global_sequence, 2);
+    order.insert(&committee, bottom.clone()).unwrap();
+    assert!(order.pop_next().is_none());
+    assert!(matches!(
+        order.insert(&committee, normal.clone()),
+        Err(PbftError::ConflictingGlobalDecision(1))
+    ));
+    let mut reverse = new_order();
+    reverse.insert(&committee, normal).unwrap();
+    assert!(matches!(
+        reverse.insert(&committee, bottom),
+        Err(PbftError::ConflictingGlobalDecision(1))
+    ));
+}
+
 type Signers = Vec<(PublicKey, SignatureService)>;
 
 fn setup() -> (Committee, Signers) {

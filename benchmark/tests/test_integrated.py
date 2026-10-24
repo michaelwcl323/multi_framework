@@ -66,6 +66,20 @@ class IntegratedBenchTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 NodeParameters(dict(params, segment_length=value))
 
+    def test_view_change_timeout_defaults_validates_and_is_written_to_node_config(self):
+        import json
+        params = dict(gc_depth=50, sync_retry_delay=1000, sync_retry_nodes=3,
+                      batch_size=2048000, max_batch_delay=200)
+        self.assertEqual(NodeParameters(params).json['view_change_timeout'], 60000)
+        explicit = NodeParameters(dict(params, view_change_timeout=1234))
+        with tempfile.TemporaryDirectory() as directory:
+            filename = str(Path(directory, 'parameters.json'))
+            explicit.print(filename)
+            self.assertEqual(json.loads(Path(filename).read_text())['view_change_timeout'], 1234)
+        for value in [0, -1, 2.5, '60000', True]:
+            with self.assertRaises(ConfigError):
+                NodeParameters(dict(params, view_change_timeout=value))
+
     def test_cloudlab_resolves_binaries_with_explicit_logging_environment(self):
         runner = CloudLabBench.__new__(CloudLabBench)
         runner.settings = SimpleNamespace(repo_name='iss')
