@@ -31,7 +31,7 @@ The raw transaction input and finite-epoch delivery barrier are retained.
 
 PBFT keeps separate installed and target views. A single report cannot stop
 normal voting. The validity threshold (`f+1` with equal stake) causes Core to
-freeze old-view votes, load local evidence, sign its own report and broadcast it.
+freeze old-view votes, export in-memory evidence, sign its own report and broadcast it.
 The quorum threshold (`2f+1` with equal stake) lets the designated primary build
 NewView. NewView is fully checked against local committed history before state
 is replaced. It may also safely skip views.
@@ -39,7 +39,7 @@ is replaced. It may also safely skip views.
 Prepared-but-uncommitted values execute the Prepare/Commit phases in the new
 view. A complete old Commit proof can be delivered directly by a lagging
 replica; replicas that already decided do not deliver it again. Imported
-evidence is persisted and can be exported in another view change.
+evidence is retained in memory and can be exported in another view change.
 
 The original proposer watches its segment's target view and stops proposing
 after leaving view zero. Each new epoch starts fresh at view zero. Authenticated
@@ -49,23 +49,23 @@ lookahead remains bounded; buffers are not rescanned on every normal message.
 
 ## Storage and transport
 
-Before the first Commit is signed/broadcast, Core serializes the proposal and
-Prepare quorum to `pbft/prepared/<full position>`. Final Commit votes remain
-under `pbft/committed/<full position>`. PBFT's history only retains a
-`PreparedRef` containing the position, proposal digest, batch digest and
-committed flag. It does not retain a second epoch-long payload copy.
+Prepared Evidence is exclusively in memory. At Prepare quorum, PBFT retains the
+proposal and matching Prepare votes; at Commit quorum, it attaches matching Commit
+votes. The live slot, outgoing vote actions and retained evidence share the
+proposal through `Arc`, avoiding an extra normal-path batch payload copy.
+Signing and broadcasting Commit requires no Prepared serialization or database
+operation. There are no `pbft/prepared/` writes, reads or disk-cleanup operations.
 
-ViewChange loads the indexed records and verifies their identity and complete
-certificates. Missing, corrupt or incomplete records fail closed; they are not
-silently omitted. Prepared records from all views retire at the existing local
-epoch barrier. Commit-proof retention remains unchanged.
+Live-slot cleanup preserves the evidence. ViewChange materializes wire
+certificates directly from memory, including imported committed proofs. Replacing
+PBFT at the local epoch barrier releases that epoch's evidence. Retaining payloads
+and vote quorums uses memory until this barrier, even if no view change occurs.
 
-Checked store writes acknowledge the RocksDB put result without copying and
-reading back the serialized value. WAL/sync settings are unchanged: this does
-not add fsync guarantees or reconstruct live indexes after a process restart.
-Serialization and RocksDB buffers still consume memory. Prepared writes and
-small reference/quorum bookkeeping add normal-path work, which must be measured
-separately from protocol correctness.
+Step 5's final Commit-proof write remains under `pbft/committed/<full position>`;
+its retention and the existing WAL/sync settings are unchanged. Checked writes
+acknowledge the put result without reading back its value. This does not add
+fsync guarantees. In-memory Prepared Evidence is lost on process restart, and
+crash/restart recovery is not implemented.
 
 ViewChange/NewView can exceed the transport's 8 MiB frame limit. Recovery-only
 messages are split into signed 4 MiB fragments, reassembled by authenticated
@@ -88,14 +88,19 @@ and crash/restart recovery are separate work.
 Tests cover weighted/unique quorums, signature and context tampering, highest
 prepared selection across multiple views, committed-value protection after
 slot cleanup, local atomic rejection, future-view vote replay, proposer pause,
-RocksDB evidence availability before Commit broadcast, imported proof reuse,
-epoch record cleanup, recovered global ordering/idempotence, and real TCP
+Commit broadcast without a Prepared record, shared payload ownership, imported
+in-memory proof reuse, evidence retirement at the epoch barrier, recovered global
+ordering/idempotence, and real TCP
 transport of ViewChange and NewView larger than 8 MiB. Existing normal-path
 PBFT/epoch tests remain part of the workspace suite. Benchmark parsing maps
 recovered digests to their original proposal time and client samples.
 
-Validation in this workspace: **81 Rust tests and 6 Python tests passed**;
-default-feature compilation, formatting and whitespace checks also passed.
+The in-memory evidence revision passed **78 Rust tests**, default-feature
+compilation, formatting and whitespace checks. The former RocksDB Prepared
+loader/deletion tests were removed; coverage now exercises actual retained
+evidence, shared payload ownership and epoch retirement.
+
+Validation commands (functional checks, not performance measurements):
 
 ```bash
 cargo test --workspace --all-features

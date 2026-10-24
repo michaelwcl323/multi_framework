@@ -3,12 +3,12 @@ use crate::error::{PbftError, PbftResult};
 use crate::messages::{
     Commit, CommittedBatch, Instance, PbftMessage, PrePrepare, Prepare, Sequence, SEQUENCE_WINDOW,
 };
-use crate::prepared_store::PreparedRef;
 use crate::{NewView, PreparedCertificate, ViewChange};
 use config::{Committee, Stake};
 use crypto::{Hash as _, PublicKey};
 use log::debug;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[cfg(test)]
 #[path = "tests/pbft_tests.rs"]
@@ -16,9 +16,8 @@ mod tests;
 
 #[derive(Debug)]
 pub(crate) enum Action {
-    Prepare(PrePrepare),
-    Commit(PreparedCertificate),
-    PersistPrepared(PreparedCertificate),
+    Prepare(Arc<PrePrepare>),
+    Commit(Arc<PrePrepare>),
     Decide(CommittedBatch),
     ChangeView(u64),
     NewView(Vec<ViewChange>),
@@ -26,12 +25,31 @@ pub(crate) enum Action {
 
 #[derive(Default)]
 struct Slot {
-    proposal: Option<PrePrepare>,
+    proposal: Option<Arc<PrePrepare>>,
     prepares: BTreeMap<PublicKey, Prepare>,
     commits: BTreeMap<PublicKey, Commit>,
     prepare_sent: bool,
     commit_sent: bool,
     decided: bool,
+}
+
+/// Retained until the local epoch barrier, even after live slots are removed.
+/// Share the batch with its live slot; materialize a wire certificate only when
+/// a ViewChange actually needs to report it.
+struct PreparedEvidence {
+    proposal: Arc<PrePrepare>,
+    prepares: Vec<Prepare>,
+    commits: Vec<Commit>,
+}
+
+impl PreparedEvidence {
+    fn certificate(&self) -> PreparedCertificate {
+        PreparedCertificate {
+            proposal: self.proposal.as_ref().clone(),
+            prepares: self.prepares.clone(),
+            commits: self.commits.clone(),
+        }
+    }
 }
 
 /// Deterministic segment-local PBFT. Local votes re-enter
@@ -44,8 +62,7 @@ pub(crate) struct Pbft {
     pub low_watermark: Sequence,
     pub view: u64,
     pub target_view: u64,
-    // Payloads and certificates are read from RocksDB only during view change.
-    history: BTreeMap<Sequence, PreparedRef>,
+    history: BTreeMap<Sequence, PreparedEvidence>,
     changes: BTreeMap<PublicKey, ViewChange>,
     proposed_view: u64,
     installed_view: Option<crypto::Digest>,
@@ -113,7 +130,11 @@ impl Pbft {
             self.segment.global_sn(sequence).is_some(),
             PbftError::OutsideSegment(message.position())
         );
-        if self.history.get(&sequence).map_or(false, |x| x.committed) {
+        if self
+            .history
+            .get(&sequence)
+            .map_or(false, |x| !x.commits.is_empty())
+        {
             return Ok(Vec::new());
         }
         if sequence < self.low_watermark {
@@ -147,7 +168,7 @@ impl Pbft {
                         PbftError::ConflictingProposal(sequence)
                     );
                 } else {
-                    slot.proposal = Some(proposal);
+                    slot.proposal = Some(Arc::new(proposal));
                 }
             }
             PbftMessage::Prepare(prepare) => {
@@ -203,19 +224,20 @@ impl Pbft {
                     committee.quorum_threshold()
                 );
                 slot.commit_sent = true;
-                self.history.insert(sequence, PreparedRef::new(proposal));
-                // Reuse the proposal copy already needed by the Commit action;
-                // do not retain another payload copy in the recovery history.
-                actions.push(Action::Commit(PreparedCertificate {
-                    proposal: proposal.clone(),
-                    prepares: slot
-                        .prepares
-                        .values()
-                        .filter(|x| x.proposal == digest)
-                        .cloned()
-                        .collect(),
-                    commits: Vec::new(),
-                }));
+                self.history.insert(
+                    sequence,
+                    PreparedEvidence {
+                        proposal: proposal.clone(),
+                        prepares: slot
+                            .prepares
+                            .values()
+                            .filter(|x| x.proposal == digest)
+                            .cloned()
+                            .collect(),
+                        commits: Vec::new(),
+                    },
+                );
+                actions.push(Action::Commit(proposal.clone()));
             }
             let commit_weight: Stake = slot
                 .commits
@@ -240,9 +262,9 @@ impl Pbft {
                     .filter(|x| x.proposal == digest)
                     .cloned()
                     .collect();
-                self.history.get_mut(&sequence).unwrap().committed = true;
+                self.history.get_mut(&sequence).unwrap().commits = commits.clone();
                 actions.push(Action::Decide(CommittedBatch {
-                    proposal: proposal.clone(),
+                    proposal: proposal.as_ref().clone(),
                     commits,
                 }));
             }
@@ -263,7 +285,7 @@ impl Pbft {
     }
 
     /// Manual/test trigger; signing is performed by Core after voting is frozen.
-    pub fn begin_view_change(&mut self, view: u64) -> PbftResult<Vec<PreparedRef>> {
+    pub fn begin_view_change(&mut self, view: u64) -> PbftResult<Vec<PreparedCertificate>> {
         ensure!(
             view > self.view && view >= self.target_view,
             PbftError::WrongView {
@@ -272,7 +294,11 @@ impl Pbft {
             }
         );
         self.target_view = view;
-        Ok(self.history.values().cloned().collect())
+        Ok(self
+            .history
+            .values()
+            .map(PreparedEvidence::certificate)
+            .collect())
     }
 
     fn check_report(&self, change: &ViewChange) -> PbftResult<()> {
@@ -354,9 +380,10 @@ impl Pbft {
             .map(|p| (p.position.sequence, p))
             .collect();
         for (sequence, certificate) in &self.history {
-            if certificate.committed {
+            if !certificate.commits.is_empty() {
                 ensure!(
-                    selected.get(sequence).map(|p| &p.batch.id) == Some(&certificate.batch),
+                    selected.get(sequence).map(|p| &p.batch.id)
+                        == Some(&certificate.proposal.batch.id),
                     PbftError::InvalidRecovery
                 );
             }
@@ -385,12 +412,16 @@ impl Pbft {
                 let known = self
                     .history
                     .get(&sequence)
-                    .map_or(false, |old| old.committed);
+                    .map_or(false, |old| !old.commits.is_empty());
                 if !known {
-                    let mut reference = PreparedRef::new(&certificate.proposal);
-                    reference.committed = true;
-                    self.history.insert(sequence, reference);
-                    actions.push(Action::PersistPrepared(certificate.clone()));
+                    self.history.insert(
+                        sequence,
+                        PreparedEvidence {
+                            proposal: Arc::new(certificate.proposal.clone()),
+                            prepares: certificate.prepares.clone(),
+                            commits: certificate.commits.clone(),
+                        },
+                    );
                     actions.push(Action::Decide(CommittedBatch {
                         proposal: certificate.proposal.clone(),
                         commits: certificate.commits.clone(),
@@ -399,7 +430,7 @@ impl Pbft {
             }
         }
         for (sequence, certificate) in &self.history {
-            if *sequence >= self.low_watermark && certificate.committed {
+            if *sequence >= self.low_watermark && !certificate.commits.is_empty() {
                 self.slots.insert(
                     *sequence,
                     Slot {
@@ -417,7 +448,7 @@ impl Pbft {
             if self
                 .history
                 .get(&proposal.position.sequence)
-                .map_or(false, |x| x.committed)
+                .map_or(false, |x| !x.commits.is_empty())
             {
                 continue;
             }

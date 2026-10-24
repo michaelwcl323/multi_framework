@@ -6,7 +6,6 @@ mod core;
 mod epoch;
 mod messages;
 mod pbft;
-mod prepared_store;
 mod primary;
 mod proposer;
 mod transport;

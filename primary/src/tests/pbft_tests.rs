@@ -37,6 +37,34 @@ fn accept(state: &mut Pbft, proposal: &PrePrepare) {
 }
 
 #[test]
+fn prepared_evidence_shares_live_payload_and_survives_slot_cleanup() {
+    let mut state = state_for(committee(), 0);
+    let pp = proposal(1, vec![vec![7; 4096]]);
+    accept(&mut state, &pp);
+    for vote in prepares(&pp).into_iter().take(3) {
+        state.process(PbftMessage::Prepare(vote)).unwrap();
+    }
+    let live = state.slots[&1].proposal.as_ref().unwrap();
+    assert!(Arc::ptr_eq(live, &state.history[&1].proposal));
+    let retained = Arc::downgrade(live);
+    for vote in commits(&pp).into_iter().take(3) {
+        state.process(PbftMessage::Commit(vote)).unwrap();
+    }
+    assert!(state.slots.is_empty());
+    assert!(retained.upgrade().is_some());
+    let evidence = state.begin_view_change(1).unwrap();
+    assert_eq!(evidence.len(), 1);
+    evidence[0].verify(&committee()).unwrap();
+    assert_eq!(
+        evidence[0].proposal.batch.transactions,
+        pp.batch.transactions
+    );
+    assert_eq!(evidence[0].commits.len(), 3);
+    drop(state);
+    assert!(retained.upgrade().is_none());
+}
+
+#[test]
 fn duplicate_messages_do_not_add_weight_or_repeat_actions() {
     let mut state = state_for(committee(), 0);
     let pp = proposal(1, vec![vec![1]]);

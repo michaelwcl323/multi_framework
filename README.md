@@ -75,10 +75,11 @@ global SN. Old-view votes stop counting after a replica leaves that view, and
 committed values survive local slot cleanup and cannot be replaced or delivered
 twice. These messages and certificates are exposed by the `primary` crate.
 
-Prepared payloads and votes are stored in RocksDB before broadcasting Commit;
-the in-memory history keeps only position/digest references. ViewChange loads and
-validates the indexed evidence. This adds a normal-path Prepared write; it is not
-a claim of zero performance overhead. Records retire at the local epoch barrier.
+Prepared Evidence stays in memory until the local epoch barrier. Live slots and
+recovery history share the proposal payload; preparing a batch adds no RocksDB
+write or wait before Commit. ViewChange exports this in-memory evidence directly.
+The existing final Commit-proof write is retained. Evidence is lost on process
+restart; crash recovery is outside this step.
 Large recovery messages use authenticated fragments on the existing PBFT
 transport. Client transactions continue to feed their local proposer directly.
 

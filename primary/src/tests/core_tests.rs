@@ -14,6 +14,12 @@ use tokio::time::{timeout, Duration};
 #[derive(Clone)]
 struct Observer(Sender<PrimaryMessage>);
 
+fn evidence_key(prefix: &[u8], position: Position) -> PbftResult<Vec<u8>> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(&bincode::serialize(&position)?);
+    Ok(key)
+}
+
 #[async_trait]
 impl MessageHandler for Observer {
     async fn dispatch(&self, writer: &mut Writer, bytes: Bytes) -> Result<(), Box<dyn Error>> {
@@ -98,14 +104,15 @@ async fn backup_broadcasts_prepare_and_commit_to_every_other_replica() {
         }
     }
     assert!(output.try_recv().is_err());
-    // Our local Commit is also already counted.
-    // A Commit must never escape before its prepared evidence is readable.
-    let reference = crate::prepared_store::PreparedRef::new(&pp);
-    let durable = load_certificate(&mut store, &committee, &reference)
+    // Commit is broadcast without creating a Prepared record or a final proof.
+    assert!(store
+        .read(evidence_key(b"pbft/prepared/", pp.position).unwrap())
         .await
-        .unwrap();
-    assert_eq!(durable.proposal.digest(), pp.digest());
-    assert!(durable.commits.is_empty());
+        .unwrap()
+        .is_none());
+    let committed_key = evidence_key(b"pbft/committed/", pp.position).unwrap();
+    assert!(store.read(committed_key.clone()).await.unwrap().is_none());
+    // Our local Commit is also already counted.
     for vote in commits(&pp)
         .into_iter()
         .filter(|vote| vote.author != name)
@@ -119,6 +126,15 @@ async fn backup_broadcasts_prepare_and_commit_to_every_other_replica() {
         .unwrap();
     decision.verify(&committee).unwrap();
     assert_eq!(decision.proposal.digest(), pp.digest());
+    // Preserve Step 5's final Commit-proof write after a quorum is reached.
+    let votes: Vec<Commit> =
+        bincode::deserialize(&store.read(committed_key).await.unwrap().unwrap()).unwrap();
+    CommittedBatch {
+        proposal: pp,
+        commits: votes,
+    }
+    .verify(&committee)
+    .unwrap();
     // No fourth certificate-broadcast phase follows the Commit messages.
     for observer in &mut observers {
         assert!(observer.try_recv().is_err());
@@ -146,7 +162,7 @@ async fn future_epoch_messages_wait_for_barrier_then_replay_once() {
     let (_tx_proposer, rx_proposer) = channel(10);
     let (tx_output, mut output) = channel(10);
     let (epoch, rx_epoch) = tokio::sync::watch::channel(0);
-    Core::spawn(
+    let mut progress = Core::spawn(
         name,
         committee.clone(),
         0,
@@ -195,7 +211,7 @@ async fn future_epoch_messages_wait_for_barrier_then_replay_once() {
     decision.verify(&committee).unwrap();
     assert_eq!(decision.proposal.digest(), proposal.digest());
     let prepared_key = evidence_key(b"pbft/prepared/", proposal.position).unwrap();
-    assert!(store.read(prepared_key.clone()).await.unwrap().is_some());
+    assert!(store.read(prepared_key.clone()).await.unwrap().is_none());
     for message in messages {
         tx.send(message).await.unwrap();
     }
@@ -210,8 +226,8 @@ async fn future_epoch_messages_wait_for_barrier_then_replay_once() {
         .is_err());
     epoch.send(2).unwrap();
     timeout(Duration::from_secs(2), async {
-        while store.read(prepared_key.clone()).await.unwrap().is_some() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        while *progress.borrow_and_update() != (2, 0) {
+            progress.changed().await.unwrap();
         }
     })
     .await
@@ -221,6 +237,34 @@ async fn future_epoch_messages_wait_for_barrier_then_replay_once() {
         .await
         .unwrap()
         .is_some());
+    assert!(store.read(prepared_key).await.unwrap().is_none());
+    // A fresh epoch must report no previous-epoch in-memory evidence.
+    for (author, secret) in keys().into_iter().filter(|(key, _)| *key != name).take(2) {
+        let mut report = ViewChange {
+            epoch: 2,
+            instance: 0,
+            view: 1,
+            prepared: vec![],
+            author,
+            signature: crypto::Signature::default(),
+        };
+        report.signature = crypto::Signature::new(&report.digest(), &secret);
+        tx.send(PbftMessage::ViewChange(report)).await.unwrap();
+    }
+    let report = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(PrimaryMessage::Pbft(PbftMessage::ViewChange(change))) =
+                observers[0].recv().await
+            {
+                break change;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    report.verify(&committee).unwrap();
+    assert_eq!(report.epoch, 2);
+    assert!(report.prepared.is_empty());
 }
 
 #[tokio::test]
@@ -339,7 +383,7 @@ async fn segment_primary_builds_new_view_and_replays_votes_that_arrive_before_it
 }
 
 #[tokio::test]
-async fn lagging_core_stores_imported_commit_evidence_for_the_next_view_change() {
+async fn lagging_core_retains_imported_commit_evidence_in_memory_for_the_next_view_change() {
     let committee = committee_with_base_port(21_000);
     let name = crate::leader(&committee, 0).unwrap();
     let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
@@ -411,12 +455,11 @@ async fn lagging_core_stores_imported_commit_evidence_for_the_next_view_change()
         .unwrap();
     decision.verify(&committee).unwrap();
     assert_eq!(decision.proposal.position, original.position);
-    let mut reference = crate::prepared_store::PreparedRef::new(&original);
-    reference.committed = true;
-    let loaded = load_certificate(&mut store, &committee, &reference)
+    assert!(store
+        .read(evidence_key(b"pbft/prepared/", original.position).unwrap())
         .await
-        .unwrap();
-    assert_eq!(loaded.commits.len(), 3);
+        .unwrap()
+        .is_none());
     for (author, secret) in keys().into_iter().filter(|(key, _)| *key != name).take(2) {
         let mut report = ViewChange {
             epoch: 0,

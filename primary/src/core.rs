@@ -5,14 +5,13 @@ use crate::messages::{
     Commit, CommittedBatch, Instance, PbftMessage, Position, PrePrepare, Prepare, Sequence,
 };
 use crate::pbft::{Action, Pbft};
-use crate::prepared_store::{evidence_key, load_certificate};
 use crate::transport::Network;
 use crate::{NewView, ViewChange};
 use config::Committee;
 use crypto::{Hash as _, PublicKey, SignatureService};
 use log::{debug, info, warn};
 use network::CancelHandler;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
@@ -39,7 +38,6 @@ pub(crate) struct Core {
     tx_proposer: Option<Sender<Position>>,
     network: Network,
     cancel_handlers: HashMap<GlobalSn, Vec<CancelHandler>>,
-    prepared_keys: BTreeSet<Vec<u8>>,
 }
 
 impl Core {
@@ -86,7 +84,6 @@ impl Core {
                 tx_proposer,
                 network,
                 cancel_handlers: HashMap::new(),
-                prepared_keys: BTreeSet::new(),
             }
             .run()
             .await;
@@ -96,17 +93,6 @@ impl Core {
 
     async fn persist(&mut self, key: Vec<u8>, bytes: Vec<u8>) -> PbftResult<()> {
         self.store.write_checked(key, bytes).await?;
-        Ok(())
-    }
-
-    async fn persist_prepared(
-        &mut self,
-        certificate: &crate::PreparedCertificate,
-    ) -> PbftResult<()> {
-        let key = evidence_key(b"pbft/prepared/", certificate.proposal.position)?;
-        self.persist(key.clone(), bincode::serialize(certificate)?)
-            .await?;
-        self.prepared_keys.insert(key);
         Ok(())
     }
 
@@ -237,14 +223,8 @@ impl Core {
         while let Some(action) = actions.pop_front() {
             let outgoing = match action {
                 Action::ChangeView(view) => {
-                    let references = self.pbft.begin_view_change(view)?;
+                    let prepared = self.pbft.begin_view_change(view)?;
                     self.publish_view();
-                    let mut prepared = Vec::with_capacity(references.len());
-                    for reference in references {
-                        prepared.push(
-                            load_certificate(&mut self.store, &self.committee, &reference).await?,
-                        );
-                    }
                     Some(PbftMessage::ViewChange(
                         ViewChange::new(
                             self.epoch.number,
@@ -273,16 +253,9 @@ impl Core {
                 Action::Prepare(proposal) => Some(PbftMessage::Prepare(
                     Prepare::new(&proposal, self.name, &mut self.signatures).await,
                 )),
-                Action::Commit(certificate) => {
-                    self.persist_prepared(&certificate).await?;
-                    Some(PbftMessage::Commit(
-                        Commit::new(&certificate.proposal, self.name, &mut self.signatures).await,
-                    ))
-                }
-                Action::PersistPrepared(certificate) => {
-                    self.persist_prepared(&certificate).await?;
-                    None
-                }
+                Action::Commit(proposal) => Some(PbftMessage::Commit(
+                    Commit::new(&proposal, self.name, &mut self.signatures).await,
+                )),
                 Action::Decide(decision) => {
                     #[cfg(feature = "benchmark")]
                     if !decision.proposal.batch.transactions.is_empty() {
@@ -304,8 +277,8 @@ impl Core {
                         decision.commits.len()
                     );
                     let position = decision.proposal.position;
-                    let key = evidence_key(b"pbft/committed/", position)?;
-                    // The prepared record already contains proposal and payload.
+                    let mut key = b"pbft/committed/".to_vec();
+                    key.extend_from_slice(&bincode::serialize(&position)?);
                     self.persist(key, bincode::serialize(&decision.commits)?)
                         .await?;
                     self.tx_consensus
@@ -410,17 +383,10 @@ impl Core {
                     epoch_number > self.epoch.number,
                     "Epoch must not move backwards"
                 );
-                // Recovery evidence retires at the local epoch barrier.
-                // Final Commit proofs keep their existing retention.
-                let keys = std::mem::take(&mut self.prepared_keys)
-                    .into_iter()
-                    .collect();
-                if let Err(error) = self.store.delete_checked(keys).await {
-                    panic!("PBFT storage failure while retiring epoch: {}", error);
-                }
                 self.epoch = Epoch::new(epoch_number, self.epoch.length(), self.epoch.segments())
                     .expect("Global sequence space exhausted");
                 let segment = self.epoch.segment(self.pbft.segment.instance).unwrap();
+                // Replacing PBFT drops the previous epoch's in-memory evidence.
                 self.pbft = Pbft::new(self.committee.clone(), segment);
                 self.publish_view();
                 debug!(

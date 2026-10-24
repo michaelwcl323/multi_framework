@@ -63,20 +63,23 @@ fn prepare_at(state: &mut Pbft, proposal: &PrePrepare) {
     }
 }
 
-// Pure state-machine tests supply the fixture represented by a storage index.
-// prepared_store/Core tests exercise the actual RocksDB writes and reads.
-fn export_fixture(
+// Exercise the actual retained evidence, including after live-slot cleanup.
+fn export_evidence(
     state: &mut Pbft,
     view: u64,
     proof: PreparedCertificate,
 ) -> Vec<PreparedCertificate> {
-    let references = state.begin_view_change(view).unwrap();
-    assert_eq!(references.len(), 1);
-    assert_eq!(references[0].position, proof.proposal.position);
-    assert_eq!(references[0].proposal, proof.proposal.digest());
-    assert_eq!(references[0].batch, proof.proposal.batch.id);
-    assert_eq!(references[0].committed, !proof.commits.is_empty());
-    vec![proof]
+    let evidence = state.begin_view_change(view).unwrap();
+    assert_eq!(evidence.len(), 1);
+    evidence[0].verify(&committee()).unwrap();
+    assert_eq!(evidence[0].proposal.digest(), proof.proposal.digest());
+    assert_eq!(
+        evidence[0].proposal.batch.transactions,
+        proof.proposal.batch.transactions
+    );
+    assert_eq!(evidence[0].prepares.len(), proof.prepares.len());
+    assert_eq!(evidence[0].commits.len(), proof.commits.len());
+    evidence
 }
 
 fn resign_new_view(view: &mut NewView) {
@@ -174,7 +177,7 @@ async fn prepared_but_uncommitted_batch_is_recovered_and_commits_in_new_view() {
     let pp = proposal_for(3, 5, vec![vec![9; 50]]);
     let mut old = state(3);
     prepare_at(&mut old, &pp);
-    let saved = export_fixture(&mut old, 1, certificate(pp.clone(), false));
+    let saved = export_evidence(&mut old, 1, certificate(pp.clone(), false));
     assert_eq!(saved.len(), 1);
     assert!(saved[0].commits.is_empty());
     let view = build(vec![
@@ -300,7 +303,7 @@ async fn committed_history_survives_slot_cleanup_and_is_delivered_to_lagging_rep
         replica.process(PbftMessage::Commit(commit)).unwrap();
     }
     assert_eq!(replica.low_watermark, 2);
-    let saved = export_fixture(&mut replica, 1, certificate(pp.clone(), true));
+    let saved = export_evidence(&mut replica, 1, certificate(pp.clone(), true));
     assert_eq!(saved[0].commits.len(), 3);
     let view = build(vec![
         report(0, 0, 1, saved),
@@ -314,10 +317,7 @@ async fn committed_history_survives_slot_cleanup_and_is_delivered_to_lagging_rep
         .is_empty());
     let mut lagging = state(0);
     let actions = lagging.process(PbftMessage::NewView(view.clone())).unwrap();
-    assert!(matches!(
-        actions.as_slice(),
-        [Action::PersistPrepared(_), Action::Decide(_)]
-    ));
+    assert!(matches!(actions.as_slice(), [Action::Decide(_)]));
     assert_eq!(lagging.low_watermark, 2);
     assert!(lagging
         .process(PbftMessage::NewView(view))
@@ -330,7 +330,7 @@ async fn leaving_view_freezes_votes_and_late_messages_do_not_change_new_view() {
     let pp = proposal(1, vec![vec![7]]);
     let mut replica = state(0);
     prepare_at(&mut replica, &pp);
-    let saved = export_fixture(&mut replica, 1, certificate(pp.clone(), false));
+    let saved = export_evidence(&mut replica, 1, certificate(pp.clone(), false));
     for vote in commits(&pp) {
         assert!(replica
             .process(PbftMessage::Commit(vote))
@@ -357,7 +357,8 @@ async fn leaving_view_freezes_votes_and_late_messages_do_not_change_new_view() {
     assert_eq!(replica.view, 1);
     assert_eq!(replica.low_watermark, 1);
     let reports = replica.begin_view_change(2).unwrap();
-    assert_eq!(reports.len(), 1); // The old prepared record is still referenced.
+    assert_eq!(reports.len(), 1); // The old evidence is still available in memory.
+    reports[0].verify(&committee()).unwrap();
 }
 
 #[tokio::test]
