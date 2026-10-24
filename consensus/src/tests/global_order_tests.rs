@@ -279,3 +279,42 @@ async fn application_output_and_epoch_barrier_follow_only_the_global_prefix() {
         .is_none());
     assert_eq!(*progress.borrow(), 1);
 }
+
+#[tokio::test]
+async fn recovered_proof_keeps_global_position_and_old_view_replay_is_idempotent() {
+    let (committee, mut signers) = setup();
+    let original = decision(&committee, &mut signers, 0, 1, vec![vec![9; 64]]).await;
+    let new_primary = primary::primary(&committee, 0, 1).unwrap();
+    let signer = signers
+        .iter_mut()
+        .find(|(name, _)| *name == new_primary)
+        .unwrap();
+    let recovered = PrePrepare::recover(&original.proposal, 1, new_primary, &mut signer.1).await;
+    let mut votes = Vec::new();
+    for (name, signer) in signers.iter_mut().take(3) {
+        votes.push(Commit::new(&recovered, *name, signer).await);
+    }
+    let proof = CommittedBatch {
+        proposal: recovered,
+        commits: votes,
+    };
+    proof.verify(&committee).unwrap();
+    let mut order = new_order();
+    order.insert(&committee, proof).unwrap();
+    order.insert(&committee, original.clone()).unwrap();
+    assert_eq!(order.pending.len(), 1);
+    let output = order.pop_next().unwrap();
+    assert_eq!(output.global_sequence, 1);
+    assert_eq!(output.committed.proposal.position.view, 1);
+    assert_eq!(
+        output.committed.proposal.batch.id,
+        original.proposal.batch.id
+    );
+    order.insert(&committee, original).unwrap();
+    assert!(order.pop_next().is_none());
+    let conflicting = decision(&committee, &mut signers, 0, 1, vec![vec![8; 64]]).await;
+    assert!(matches!(
+        order.insert(&committee, conflicting),
+        Err(PbftError::ConflictingGlobalDecision(1))
+    ));
+}

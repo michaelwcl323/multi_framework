@@ -3,6 +3,8 @@ use crate::error::{PbftError, PbftResult};
 use crate::messages::{
     Commit, CommittedBatch, Instance, PbftMessage, PrePrepare, Prepare, Sequence, SEQUENCE_WINDOW,
 };
+use crate::prepared_store::PreparedRef;
+use crate::{NewView, PreparedCertificate, ViewChange};
 use config::{Committee, Stake};
 use crypto::{Hash as _, PublicKey};
 use log::debug;
@@ -15,8 +17,11 @@ mod tests;
 #[derive(Debug)]
 pub(crate) enum Action {
     Prepare(PrePrepare),
-    Commit(PrePrepare),
+    Commit(PreparedCertificate),
+    PersistPrepared(PreparedCertificate),
     Decide(CommittedBatch),
+    ChangeView(u64),
+    NewView(Vec<ViewChange>),
 }
 
 #[derive(Default)]
@@ -29,7 +34,7 @@ struct Slot {
     decided: bool,
 }
 
-/// Deterministic fixed-leader, fixed-view PBFT normal path. Local votes re-enter
+/// Deterministic segment-local PBFT. Local votes re-enter
 /// through `process`, exactly like remote votes; transport ACKs never enter here.
 pub(crate) struct Pbft {
     committee: Committee,
@@ -37,6 +42,14 @@ pub(crate) struct Pbft {
     pub segment: Segment,
     slots: BTreeMap<Sequence, Slot>,
     pub low_watermark: Sequence,
+    pub view: u64,
+    pub target_view: u64,
+    // Payloads and certificates are read from RocksDB only during view change.
+    history: BTreeMap<Sequence, PreparedRef>,
+    changes: BTreeMap<PublicKey, ViewChange>,
+    proposed_view: u64,
+    installed_view: Option<crypto::Digest>,
+    recovery: BTreeMap<Sequence, crypto::Digest>,
 }
 
 impl Pbft {
@@ -52,6 +65,13 @@ impl Pbft {
             segment,
             slots: BTreeMap::new(),
             low_watermark: 1,
+            view: 0,
+            target_view: 0,
+            history: BTreeMap::new(),
+            changes: BTreeMap::new(),
+            proposed_view: 0,
+            installed_view: None,
+            recovery: BTreeMap::new(),
         }
     }
 
@@ -70,17 +90,38 @@ impl Pbft {
                 received: message.position().instance
             }
         );
+        match &message {
+            PbftMessage::ViewChange(change) => return self.view_change(change.clone()),
+            PbftMessage::NewView(view) => return self.install_view(view.clone()),
+            _ => (),
+        }
+        let position = message.position();
+        // Leaving a view freezes all of its normal-path voting immediately.
+        if position.view < self.target_view {
+            return Ok(Vec::new());
+        }
+        ensure!(
+            position.view == self.view && self.view == self.target_view,
+            PbftError::WrongView {
+                expected: self.target_view,
+                received: position.view
+            }
+        );
         message.verify(&self.committee)?;
         let sequence = message.position().sequence;
         ensure!(
             self.segment.global_sn(sequence).is_some(),
             PbftError::OutsideSegment(message.position())
         );
+        if self.history.get(&sequence).map_or(false, |x| x.committed) {
+            return Ok(Vec::new());
+        }
         if sequence < self.low_watermark {
             return Ok(Vec::new());
         }
         ensure!(
-            sequence - self.low_watermark < SEQUENCE_WINDOW,
+            sequence - self.low_watermark < SEQUENCE_WINDOW
+                || self.recovery.contains_key(&sequence),
             PbftError::OutsideWindow(sequence)
         );
 
@@ -88,6 +129,12 @@ impl Pbft {
         let slot = self.slots.entry(sequence).or_default();
         match message {
             PbftMessage::PrePrepare(proposal) => {
+                if self.view > 0 {
+                    ensure!(
+                        self.recovery.get(&sequence) == Some(&proposal.digest()),
+                        PbftError::InvalidRecovery
+                    );
+                }
                 debug!(
                     "Received PrePrepare position={:?} sender={} proposal={:?} batch={:?} tx_count={} tx_bytes={}",
                     proposal.position, proposal.author, proposal.digest(), proposal.batch.id,
@@ -131,6 +178,7 @@ impl Pbft {
                     slot.commits.insert(commit.author, commit);
                 }
             }
+            PbftMessage::ViewChange(_) | PbftMessage::NewView(_) => unreachable!(),
         }
 
         let mut actions = Vec::new();
@@ -155,7 +203,19 @@ impl Pbft {
                     committee.quorum_threshold()
                 );
                 slot.commit_sent = true;
-                actions.push(Action::Commit(proposal.clone()));
+                self.history.insert(sequence, PreparedRef::new(proposal));
+                // Reuse the proposal copy already needed by the Commit action;
+                // do not retain another payload copy in the recovery history.
+                actions.push(Action::Commit(PreparedCertificate {
+                    proposal: proposal.clone(),
+                    prepares: slot
+                        .prepares
+                        .values()
+                        .filter(|x| x.proposal == digest)
+                        .cloned()
+                        .collect(),
+                    commits: Vec::new(),
+                }));
             }
             let commit_weight: Stake = slot
                 .commits
@@ -174,14 +234,16 @@ impl Pbft {
                     committee.quorum_threshold()
                 );
                 slot.decided = true;
+                let commits: Vec<_> = slot
+                    .commits
+                    .values()
+                    .filter(|x| x.proposal == digest)
+                    .cloned()
+                    .collect();
+                self.history.get_mut(&sequence).unwrap().committed = true;
                 actions.push(Action::Decide(CommittedBatch {
                     proposal: proposal.clone(),
-                    commits: slot
-                        .commits
-                        .values()
-                        .filter(|x| x.proposal == digest)
-                        .cloned()
-                        .collect(),
+                    commits,
                 }));
             }
         }
@@ -196,6 +258,170 @@ impl Pbft {
                 "Completed segment epoch={} instance={} slots={}",
                 self.segment.epoch, self.segment.instance, self.segment.slots
             );
+        }
+        Ok(actions)
+    }
+
+    /// Manual/test trigger; signing is performed by Core after voting is frozen.
+    pub fn begin_view_change(&mut self, view: u64) -> PbftResult<Vec<PreparedRef>> {
+        ensure!(
+            view > self.view && view >= self.target_view,
+            PbftError::WrongView {
+                expected: self.target_view,
+                received: view
+            }
+        );
+        self.target_view = view;
+        Ok(self.history.values().cloned().collect())
+    }
+
+    fn check_report(&self, change: &ViewChange) -> PbftResult<()> {
+        change.verify(&self.committee)?;
+        ensure!(
+            change.epoch == self.segment.epoch && change.instance == self.instance,
+            PbftError::InvalidRecovery
+        );
+        for certificate in &change.prepared {
+            ensure!(
+                self.segment
+                    .global_sn(certificate.proposal.position.sequence)
+                    .is_some(),
+                PbftError::OutsideSegment(certificate.proposal.position)
+            );
+        }
+        Ok(())
+    }
+
+    fn view_change(&mut self, change: ViewChange) -> PbftResult<Vec<Action>> {
+        self.check_report(&change)?;
+        if change.view <= self.view || change.view < self.target_view {
+            return Ok(Vec::new());
+        }
+        if let Some(previous) = self.changes.get(&change.author) {
+            if previous.view > change.view {
+                return Ok(Vec::new());
+            }
+            if previous.view == change.view {
+                ensure!(
+                    previous.digest() == change.digest(),
+                    PbftError::ConflictingViewChange(change.author)
+                );
+                return Ok(Vec::new());
+            }
+        }
+        let view = change.view;
+        self.changes.insert(change.author, change);
+        let reports: Vec<_> = self
+            .changes
+            .values()
+            .filter(|x| x.view == view)
+            .cloned()
+            .collect();
+        let weight: Stake = reports
+            .iter()
+            .map(|x| self.committee.stake(&x.author))
+            .sum();
+        let mut actions = Vec::new();
+        // A single faulty node cannot make the replica abandon its active view.
+        if view > self.target_view && weight >= self.committee.validity_threshold() {
+            actions.push(Action::ChangeView(view));
+        }
+        if weight >= self.committee.quorum_threshold() && self.proposed_view < view {
+            self.proposed_view = view;
+            actions.push(Action::NewView(reports));
+        }
+        Ok(actions)
+    }
+
+    fn install_view(&mut self, new_view: NewView) -> PbftResult<Vec<Action>> {
+        new_view.verify(&self.committee)?;
+        for change in &new_view.changes {
+            self.check_report(change)?;
+        }
+        if new_view.view < self.target_view || new_view.view < self.view {
+            return Ok(Vec::new());
+        }
+        if new_view.view == self.view {
+            ensure!(
+                self.installed_view.as_ref() == Some(&new_view.digest()),
+                PbftError::InvalidRecovery
+            );
+            return Ok(Vec::new());
+        }
+        let selected: BTreeMap<_, _> = new_view
+            .proposals
+            .iter()
+            .map(|p| (p.position.sequence, p))
+            .collect();
+        for (sequence, certificate) in &self.history {
+            if certificate.committed {
+                ensure!(
+                    selected.get(sequence).map(|p| &p.batch.id) == Some(&certificate.batch),
+                    PbftError::InvalidRecovery
+                );
+            }
+        }
+        // Verify the complete NewView before changing any protocol state.
+        self.slots.clear();
+        self.view = new_view.view;
+        self.target_view = new_view.view;
+        self.installed_view = Some(new_view.digest());
+        self.recovery = new_view
+            .proposals
+            .iter()
+            .map(|p| (p.position.sequence, p.digest()))
+            .collect();
+        let view = self.view;
+        self.changes.retain(|_, report| report.view > view);
+        let mut actions = Vec::new();
+        // A complete old commit certificate can be delivered directly to a
+        // lagging replica; replicas that already decided do not deliver twice.
+        for change in &new_view.changes {
+            for certificate in &change.prepared {
+                if certificate.commits.is_empty() {
+                    continue;
+                }
+                let sequence = certificate.proposal.position.sequence;
+                let known = self
+                    .history
+                    .get(&sequence)
+                    .map_or(false, |old| old.committed);
+                if !known {
+                    let mut reference = PreparedRef::new(&certificate.proposal);
+                    reference.committed = true;
+                    self.history.insert(sequence, reference);
+                    actions.push(Action::PersistPrepared(certificate.clone()));
+                    actions.push(Action::Decide(CommittedBatch {
+                        proposal: certificate.proposal.clone(),
+                        commits: certificate.commits.clone(),
+                    }));
+                }
+            }
+        }
+        for (sequence, certificate) in &self.history {
+            if *sequence >= self.low_watermark && certificate.committed {
+                self.slots.insert(
+                    *sequence,
+                    Slot {
+                        decided: true,
+                        ..Slot::default()
+                    },
+                );
+            }
+        }
+        while matches!(self.slots.get(&self.low_watermark), Some(slot) if slot.decided) {
+            self.slots.remove(&self.low_watermark);
+            self.low_watermark += 1;
+        }
+        for proposal in new_view.proposals {
+            if self
+                .history
+                .get(&proposal.position.sequence)
+                .map_or(false, |x| x.committed)
+            {
+                continue;
+            }
+            actions.extend(self.process(PbftMessage::PrePrepare(proposal))?);
         }
         Ok(actions)
     }

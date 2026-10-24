@@ -5,14 +5,14 @@ use crate::messages::{
     Commit, CommittedBatch, Instance, PbftMessage, Position, PrePrepare, Prepare, Sequence,
 };
 use crate::pbft::{Action, Pbft};
+use crate::prepared_store::{evidence_key, load_certificate};
 use crate::transport::Network;
+use crate::{NewView, ViewChange};
 use config::Committee;
 use crypto::{Hash as _, PublicKey, SignatureService};
-#[cfg(feature = "benchmark")]
-use log::info;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use network::CancelHandler;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
@@ -30,7 +30,8 @@ pub(crate) struct Core {
     committee: Committee,
     epoch: Epoch,
     rx_epoch: watch::Receiver<u64>,
-    future_messages: BTreeMap<(Sequence, u8, PublicKey), (PbftMessage, bool)>,
+    future_messages: BTreeMap<(u64, u64, Sequence, u8, PublicKey), (PbftMessage, bool)>,
+    tx_view: watch::Sender<(u64, u64)>,
     gc_depth: Sequence,
     rx_messages: Receiver<PbftMessage>,
     rx_proposer: Receiver<PrePrepare>,
@@ -38,6 +39,7 @@ pub(crate) struct Core {
     tx_proposer: Option<Sender<Position>>,
     network: Network,
     cancel_handlers: HashMap<GlobalSn, Vec<CancelHandler>>,
+    prepared_keys: BTreeSet<Vec<u8>>,
 }
 
 impl Core {
@@ -56,7 +58,8 @@ impl Core {
         tx_consensus: Sender<CommittedBatch>,
         tx_proposer: Option<Sender<Position>>,
         network: Network,
-    ) {
+    ) -> watch::Receiver<(u64, u64)> {
+        let (tx_view, rx_view) = watch::channel((*rx_epoch.borrow(), 0));
         tokio::spawn(async move {
             let epoch = Epoch::new(*rx_epoch.borrow(), epoch_length, committee.size() as u64)
                 .expect("Invalid epoch layout");
@@ -73,6 +76,7 @@ impl Core {
                 epoch,
                 rx_epoch,
                 future_messages: BTreeMap::new(),
+                tx_view,
                 store,
                 signatures,
                 gc_depth,
@@ -82,18 +86,27 @@ impl Core {
                 tx_proposer,
                 network,
                 cancel_handlers: HashMap::new(),
+                prepared_keys: BTreeSet::new(),
             }
             .run()
             .await;
         });
+        rx_view
     }
 
     async fn persist(&mut self, key: Vec<u8>, bytes: Vec<u8>) -> PbftResult<()> {
-        self.store.write(key.clone(), bytes.clone()).await;
-        ensure!(
-            self.store.read(key).await?.as_deref() == Some(bytes.as_slice()),
-            PbftError::StorageFailure
-        );
+        self.store.write_checked(key, bytes).await?;
+        Ok(())
+    }
+
+    async fn persist_prepared(
+        &mut self,
+        certificate: &crate::PreparedCertificate,
+    ) -> PbftResult<()> {
+        let key = evidence_key(b"pbft/prepared/", certificate.proposal.position)?;
+        self.persist(key.clone(), bincode::serialize(certificate)?)
+            .await?;
+        self.prepared_keys.insert(key);
         Ok(())
     }
 
@@ -102,6 +115,8 @@ impl Core {
             PbftMessage::PrePrepare(x) => ("PrePrepare", x.digest()),
             PbftMessage::Prepare(x) => ("Prepare", x.proposal.clone()),
             PbftMessage::Commit(x) => ("Commit", x.proposal.clone()),
+            PbftMessage::ViewChange(x) => ("ViewChange", x.digest()),
+            PbftMessage::NewView(x) => ("NewView", x.digest()),
         };
         debug!(
             "Broadcast {} node={} position={:?} proposal={:?}",
@@ -110,7 +125,14 @@ impl Core {
             message.position(),
             proposal
         );
-        let global_sn = self.epoch.global_sn(message.position()).unwrap();
+        let global_sn = if matches!(
+            &message,
+            PbftMessage::ViewChange(_) | PbftMessage::NewView(_)
+        ) {
+            self.epoch.last_sn()
+        } else {
+            self.epoch.global_sn(message.position()).unwrap()
+        };
         let handlers = self.network.broadcast(message).await;
         self.cancel_handlers
             .entry(global_sn)
@@ -124,9 +146,16 @@ impl Core {
             debug!("Ignoring old epoch message position={:?}", position);
             return Ok(());
         }
-        if position.epoch > self.epoch.number {
+        let future_view = position.epoch == self.epoch.number
+            && position.view > self.pbft.view
+            && !matches!(
+                &message,
+                PbftMessage::ViewChange(_) | PbftMessage::NewView(_)
+            );
+        if position.epoch > self.epoch.number || future_view {
             ensure!(
-                Some(position.epoch) == self.epoch.number.checked_add(1),
+                position.epoch == self.epoch.number
+                    || Some(position.epoch) == self.epoch.number.checked_add(1),
                 PbftError::WrongEpoch {
                     expected: self.epoch.number,
                     received: position.epoch
@@ -139,47 +168,121 @@ impl Core {
                     received: position.instance
                 }
             );
-            let next = self
-                .epoch
-                .next()
+            let next = Epoch::new(position.epoch, self.epoch.length(), self.epoch.segments())
                 .ok_or(PbftError::OutsideSegment(position))?;
             ensure!(
                 next.global_sn(position).is_some(),
                 PbftError::OutsideSegment(position)
             );
             ensure!(
-                position.sequence <= crate::messages::SEQUENCE_WINDOW,
+                future_view || position.sequence <= crate::messages::SEQUENCE_WINDOW,
                 PbftError::OutsideWindow(position.sequence)
             );
             message.verify(&self.committee)?;
-            let (phase, author) = match &message {
-                PbftMessage::PrePrepare(x) => (0, x.author),
-                PbftMessage::Prepare(x) => (1, x.author),
-                PbftMessage::Commit(x) => (2, x.author),
-            };
-            // Bound look-ahead to one epoch and one message per slot/phase/sender.
+            let (phase, author) = message.phase_author();
+            // Keep at most one (the latest) view per epoch/slot/phase/sender,
+            // including authenticated votes that precede a multi-view jump.
+            if self
+                .future_messages
+                .keys()
+                .any(|(epoch, view, sequence, p, sender)| {
+                    *epoch == position.epoch
+                        && *sequence == position.sequence
+                        && *p == phase
+                        && *sender == author
+                        && *view > position.view
+                })
+            {
+                return Ok(());
+            }
             self.future_messages
-                .entry((position.sequence, phase, author))
+                .retain(|(epoch, view, sequence, p, sender), _| {
+                    !(*epoch == position.epoch
+                        && *sequence == position.sequence
+                        && *p == phase
+                        && *sender == author
+                        && *view < position.view)
+                });
+            self.future_messages
+                .entry((
+                    position.epoch,
+                    position.view,
+                    position.sequence,
+                    phase,
+                    author,
+                ))
                 .or_insert((message, own_proposal));
-            debug!("Buffered next epoch message position={:?}", position);
+            debug!("Buffered future epoch/view message position={:?}", position);
             return Ok(());
         }
         self.process(message, own_proposal).await
     }
 
     async fn process(&mut self, message: PbftMessage, own_proposal: bool) -> PbftResult<()> {
+        if own_proposal && (self.pbft.view != 0 || self.pbft.target_view != 0) {
+            return Ok(());
+        }
+        let changes_view = matches!(
+            &message,
+            PbftMessage::ViewChange(_) | PbftMessage::NewView(_)
+        );
         let mut actions: VecDeque<_> = self.pbft.process(message.clone())?.into();
+        self.record_recovery(&message);
+        if changes_view {
+            self.publish_view();
+        }
         if own_proposal {
             self.broadcast(message).await;
         }
         while let Some(action) = actions.pop_front() {
             let outgoing = match action {
+                Action::ChangeView(view) => {
+                    let references = self.pbft.begin_view_change(view)?;
+                    self.publish_view();
+                    let mut prepared = Vec::with_capacity(references.len());
+                    for reference in references {
+                        prepared.push(
+                            load_certificate(&mut self.store, &self.committee, &reference).await?,
+                        );
+                    }
+                    Some(PbftMessage::ViewChange(
+                        ViewChange::new(
+                            self.epoch.number,
+                            self.pbft.segment.instance,
+                            view,
+                            prepared,
+                            self.name,
+                            &mut self.signatures,
+                        )
+                        .await,
+                    ))
+                }
+                Action::NewView(changes) => {
+                    let view = changes[0].view;
+                    if crate::primary(&self.committee, self.pbft.segment.instance, view)
+                        == Some(self.name)
+                    {
+                        Some(PbftMessage::NewView(
+                            NewView::new(&self.committee, changes, self.name, &mut self.signatures)
+                                .await?,
+                        ))
+                    } else {
+                        None
+                    }
+                }
                 Action::Prepare(proposal) => Some(PbftMessage::Prepare(
                     Prepare::new(&proposal, self.name, &mut self.signatures).await,
                 )),
-                Action::Commit(proposal) => Some(PbftMessage::Commit(
-                    Commit::new(&proposal, self.name, &mut self.signatures).await,
-                )),
+                Action::Commit(certificate) => {
+                    self.persist_prepared(&certificate).await?;
+                    Some(PbftMessage::Commit(
+                        Commit::new(&certificate.proposal, self.name, &mut self.signatures).await,
+                    ))
+                }
+                Action::PersistPrepared(certificate) => {
+                    self.persist_prepared(&certificate).await?;
+                    None
+                }
                 Action::Decide(decision) => {
                     #[cfg(feature = "benchmark")]
                     if !decision.proposal.batch.transactions.is_empty() {
@@ -201,9 +304,8 @@ impl Core {
                         decision.commits.len()
                     );
                     let position = decision.proposal.position;
-                    let mut key = b"pbft/committed/".to_vec();
-                    key.extend_from_slice(&bincode::serialize(&decision.proposal.position)?);
-                    // Store only the commit certificate, without proposal or batch payload.
+                    let key = evidence_key(b"pbft/committed/", position)?;
+                    // The prepared record already contains proposal and payload.
                     self.persist(key, bincode::serialize(&decision.commits)?)
                         .await?;
                     self.tx_consensus
@@ -218,11 +320,50 @@ impl Core {
             };
             if let Some(message) = outgoing {
                 // Count our vote through the same verified path as every remote vote.
+                let changes_view = matches!(
+                    &message,
+                    PbftMessage::ViewChange(_) | PbftMessage::NewView(_)
+                );
                 actions.extend(self.pbft.process(message.clone())?);
+                self.record_recovery(&message);
+                if changes_view {
+                    self.publish_view();
+                }
                 self.broadcast(message).await;
             }
         }
         Ok(())
+    }
+
+    fn publish_view(&self) {
+        let progress = (self.epoch.number, self.pbft.target_view);
+        if *self.tx_view.borrow() != progress {
+            if progress.1 > 0 {
+                info!(
+                    "PBFT view change epoch={} instance={} view={}",
+                    progress.0, self.pbft.segment.instance, progress.1
+                );
+            }
+            let _ = self.tx_view.send(progress);
+        }
+    }
+
+    fn record_recovery(&self, message: &PbftMessage) {
+        #[cfg(feature = "benchmark")]
+        if let PbftMessage::NewView(view) = message {
+            for proposal in &view.proposals {
+                info!(
+                    "Recovered {} -> {:?} origin_proposal={:?} epoch={} global_sn={}",
+                    proposal,
+                    proposal.digest(),
+                    proposal.original_digest(&self.committee).unwrap(),
+                    proposal.position.epoch,
+                    self.epoch.global_sn(proposal.position).unwrap()
+                );
+            }
+        }
+        #[cfg(not(feature = "benchmark"))]
+        let _ = message;
     }
 
     fn cleanup(&mut self) {
@@ -261,6 +402,7 @@ impl Core {
 
     async fn run(&mut self) {
         let mut cleanup_timer = interval(Duration::from_millis(100));
+        let mut replay_context = (0, 0);
         loop {
             let epoch_number = *self.rx_epoch.borrow_and_update();
             if epoch_number != self.epoch.number {
@@ -268,17 +410,44 @@ impl Core {
                     epoch_number > self.epoch.number,
                     "Epoch must not move backwards"
                 );
+                // Recovery evidence retires at the local epoch barrier.
+                // Final Commit proofs keep their existing retention.
+                let keys = std::mem::take(&mut self.prepared_keys)
+                    .into_iter()
+                    .collect();
+                if let Err(error) = self.store.delete_checked(keys).await {
+                    panic!("PBFT storage failure while retiring epoch: {}", error);
+                }
                 self.epoch = Epoch::new(epoch_number, self.epoch.length(), self.epoch.segments())
                     .expect("Global sequence space exhausted");
                 let segment = self.epoch.segment(self.pbft.segment.instance).unwrap();
                 self.pbft = Pbft::new(self.committee.clone(), segment);
+                self.publish_view();
                 debug!(
                     "Started segment epoch={} instance={} slots={}",
                     segment.epoch, segment.instance, segment.slots
                 );
-                for (_, (message, own_proposal)) in std::mem::take(&mut self.future_messages) {
-                    if message.position().epoch == epoch_number {
+            }
+            if replay_context != (self.epoch.number, self.pbft.view) {
+                replay_context = (self.epoch.number, self.pbft.view);
+                // Replay only the installed view; votes can precede its NewView on
+                // another peer connection and must never vote before installation.
+                let buffered = std::mem::take(&mut self.future_messages);
+                for (key, (message, own_proposal)) in buffered {
+                    let position = message.position();
+                    if position.epoch == self.epoch.number
+                        && (matches!(
+                            &message,
+                            PbftMessage::ViewChange(_) | PbftMessage::NewView(_)
+                        ) || (position.view == self.pbft.view
+                            && self.pbft.view == self.pbft.target_view))
+                    {
                         Self::report(self.process(message, own_proposal).await);
+                    } else if position.epoch > self.epoch.number
+                        || (position.epoch == self.epoch.number
+                            && position.view >= self.pbft.target_view)
+                    {
+                        self.future_messages.insert(key, (message, own_proposal));
                     }
                 }
             }

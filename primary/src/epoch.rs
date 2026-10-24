@@ -66,7 +66,7 @@ impl Epoch {
     }
 
     pub fn global_sn(&self, position: Position) -> Option<GlobalSn> {
-        if position.epoch != self.number || position.view != 0 {
+        if position.epoch != self.number {
             return None;
         }
         self.segment(position.instance)?

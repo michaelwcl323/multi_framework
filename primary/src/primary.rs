@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::control_transport::{ControlAssembler, ControlChunk};
 use crate::core::Core;
 use crate::messages::{CommittedBatch, PbftMessage, Transaction};
 use crate::proposer::Proposer;
@@ -12,7 +13,7 @@ use log::{info, warn};
 use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::watch;
@@ -22,6 +23,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum PrimaryMessage {
     Pbft(PbftMessage),
+    PbftChunk(ControlChunk),
 }
 
 pub struct Primary;
@@ -48,7 +50,7 @@ impl Primary {
         let (tx_transactions, rx_transactions) = channel(CHANNEL_CAPACITY);
         let mut own_transactions = Some(rx_transactions);
         let signatures = SignatureService::new(keypair.secret);
-        let network = Network::spawn(name, &committee);
+        let network = Network::spawn_with_signatures(name, &committee, Some(signatures.clone()));
         let mut routes = Vec::with_capacity(committee.size());
         let mut local_instance = None;
         parameters.log();
@@ -62,7 +64,7 @@ impl Primary {
             let (tx_proposals, rx_proposals) = channel(CHANNEL_CAPACITY);
             let (tx_committed, rx_committed) = channel(CHANNEL_CAPACITY);
             routes.push(tx_messages);
-            Core::spawn(
+            let rx_view = Core::spawn(
                 name,
                 committee.clone(),
                 instance,
@@ -91,6 +93,7 @@ impl Primary {
                     rx_committed,
                     own_transactions.take().expect("Duplicate local leader"),
                     tx_proposals,
+                    Some(rx_view),
                 );
             }
         }
@@ -104,6 +107,7 @@ impl Primary {
             address,
             PrimaryReceiverHandler {
                 routes: Arc::new(routes),
+                fragments: Arc::new(Mutex::new(ControlAssembler::new(committee.clone()))),
             },
         );
         let mut transactions = committee
@@ -141,17 +145,23 @@ impl MessageHandler for TransactionReceiver {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     routes: Arc<Vec<Sender<PbftMessage>>>,
+    fragments: Arc<Mutex<ControlAssembler>>,
 }
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, bytes: Bytes) -> Result<(), Box<dyn Error>> {
-        let PrimaryMessage::Pbft(message) = bincode::deserialize(&bytes)?;
-        let instance = message.position().instance;
-        if instance < self.routes.len() as u64 {
-            self.routes[instance as usize].send(message).await?;
-        } else {
-            warn!("Ignoring message for unknown PBFT instance {}", instance);
+        let message = match bincode::deserialize(&bytes)? {
+            PrimaryMessage::Pbft(message) => Some(message),
+            PrimaryMessage::PbftChunk(chunk) => self.fragments.lock().unwrap().insert(chunk)?,
+        };
+        if let Some(message) = message {
+            let instance = message.position().instance;
+            if instance < self.routes.len() as u64 {
+                self.routes[instance as usize].send(message).await?;
+            } else {
+                warn!("Ignoring message for unknown PBFT instance {}", instance);
+            }
         }
         // This ACK only acknowledges transport delivery, never a protocol vote.
         writer.send(Bytes::from_static(b"Ack")).await?;

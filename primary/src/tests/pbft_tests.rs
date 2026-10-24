@@ -331,6 +331,7 @@ fn invalid_senders_signatures_contexts_and_future_slots_do_not_allocate_state() 
         assert!(matches!(
             state.process(PbftMessage::PrePrepare(invalid)),
             Err(PbftError::UnsupportedPosition(_))
+                | Err(PbftError::WrongView { .. })
                 | Err(PbftError::WrongInstance { .. })
                 | Err(PbftError::WrongEpoch { .. })
         ));

@@ -40,7 +40,7 @@ pub enum PbftError {
     UnexpectedLeader(PublicKey),
     #[error("Authority {0} appears in quorum more than once")]
     AuthorityReuse(PublicKey),
-    #[error("Commit proof requires a quorum")]
+    #[error("Certificate requires a quorum")]
     RequiresQuorum,
     #[error("Commit does not match its proposal")]
     MismatchedCommit,
@@ -63,6 +63,14 @@ pub enum PbftError {
     OutsideSegment(Position),
     #[error("Sequence {0} is beyond the receive window")]
     OutsideWindow(Sequence),
+    #[error("Message targets view {received}, expected {expected}")]
+    WrongView { expected: u64, received: u64 },
+    #[error("Invalid view-change recovery evidence")]
+    InvalidRecovery,
+    #[error("Recovery control message exceeds the size limit")]
+    ControlMessageTooLarge,
+    #[error("Conflicting view-change reports by {0}")]
+    ConflictingViewChange(PublicKey),
     #[error("Conflicting proposal at sequence {0}")]
     ConflictingProposal(Sequence),
     #[error("Conflicting vote by {0} at sequence {1}")]

@@ -177,3 +177,105 @@ async fn parallel_instances_reach_quorum_independently_with_one_leader_offline()
         assert_eq!(decision.proposal.batch.transactions, next);
     }
 }
+
+#[tokio::test]
+async fn recovery_larger_than_transport_frame_reaches_all_peers_with_full_evidence() {
+    let committee = committee_with_base_port(23_000);
+    let name = crate::primary(&committee, 0, 1).unwrap();
+    let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
+    let mut signatures = SignatureService::new(secret);
+    let mut certificates = Vec::new();
+    for sequence in 1..=5 {
+        let proposal = crate::common::proposal(sequence, vec![vec![sequence as u8; 1_800_000]]);
+        certificates.push(crate::PreparedCertificate {
+            prepares: crate::common::prepares(&proposal)
+                .into_iter()
+                .take(3)
+                .collect(),
+            proposal,
+            commits: vec![],
+        });
+    }
+    let recovery_evidence = certificates[..2].to_vec();
+    let report = crate::ViewChange::new(0, 0, 1, certificates, name, &mut signatures).await;
+    let message = PbftMessage::ViewChange(report);
+    assert!(
+        bincode::serialized_size(&PrimaryMessage::Pbft(message.clone())).unwrap() > 8 * 1024 * 1024
+    );
+    let mut outputs = Vec::new();
+    for (_, address) in committee.others_primaries(&name) {
+        let (route, output) = channel(10);
+        NetworkReceiver::spawn(
+            address.primary_to_primary,
+            PrimaryReceiverHandler {
+                routes: Arc::new(vec![route; committee.size()]),
+                fragments: Arc::new(Mutex::new(ControlAssembler::new(committee.clone()))),
+            },
+        );
+        outputs.push(output);
+    }
+    let network = Network::spawn_with_signatures(name, &committee, Some(signatures.clone()));
+    let handlers = network.broadcast(message).await;
+    assert!(handlers.len() > committee.size() - 1);
+    for output in &mut outputs {
+        let message = timeout(Duration::from_secs(30), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        message.verify(&committee).unwrap();
+        match message {
+            PbftMessage::ViewChange(report) => {
+                assert_eq!(report.prepared.len(), 5);
+                assert_eq!(
+                    report.prepared[4].proposal.batch.transactions[0].len(),
+                    1_800_000
+                );
+            }
+            _ => panic!("Expected reassembled ViewChange"),
+        }
+        assert!(output.try_recv().is_err());
+    }
+    for handler in handlers {
+        timeout(Duration::from_secs(3), handler)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let mut reports = Vec::new();
+    for (author, secret) in keys().into_iter().take(3) {
+        reports.push(
+            crate::ViewChange::new(
+                0,
+                0,
+                1,
+                recovery_evidence.clone(),
+                author,
+                &mut SignatureService::new(secret),
+            )
+            .await,
+        );
+    }
+    let new_view = crate::NewView::new(&committee, reports, name, &mut signatures)
+        .await
+        .unwrap();
+    let message = PbftMessage::NewView(new_view);
+    assert!(
+        bincode::serialized_size(&PrimaryMessage::Pbft(message.clone())).unwrap() > 8 * 1024 * 1024
+    );
+    let handlers = network.broadcast(message).await;
+    for output in &mut outputs {
+        let message = timeout(Duration::from_secs(30), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        message.verify(&committee).unwrap();
+        assert!(matches!(message, PbftMessage::NewView(view) if view.proposals.len() == 2));
+        assert!(output.try_recv().is_err());
+    }
+    for handler in handlers {
+        timeout(Duration::from_secs(3), handler)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}

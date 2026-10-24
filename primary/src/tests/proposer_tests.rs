@@ -25,6 +25,7 @@ async fn proposer_waits_for_matching_commit_before_next_sequence() {
         rx_committed,
         rx_transactions,
         tx_proposals,
+        None,
     );
     let first = timeout(Duration::from_secs(1), proposals.recv())
         .await
@@ -82,6 +83,7 @@ async fn full_batch_proposes_without_dag_parents_or_availability_ack() {
         rx_committed,
         rx_transactions,
         tx_proposals,
+        None,
     );
     tx_transactions.send(vec![7; 32]).await.unwrap();
     let proposal = timeout(Duration::from_secs(1), proposals.recv())
@@ -112,6 +114,7 @@ async fn finite_segment_waits_for_epoch_barrier_and_ignores_old_feedback() {
         rx_committed,
         rx_transactions,
         tx_core,
+        None,
     );
     for sequence in 1..=2 {
         let proposal = timeout(Duration::from_secs(1), proposals.recv())
@@ -165,6 +168,7 @@ async fn segment_with_no_assigned_slots_never_proposes() {
         rx_committed,
         rx_transactions,
         tx_core,
+        None,
     );
     assert!(timeout(Duration::from_millis(30), proposals.recv())
         .await
@@ -173,4 +177,44 @@ async fn segment_with_no_assigned_slots_never_proposes() {
     assert!(timeout(Duration::from_millis(30), proposals.recv())
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn original_sender_stops_proposing_when_its_segment_leaves_view_zero() {
+    let name = leader(&committee(), 0).unwrap();
+    let (_, secret) = keys().into_iter().find(|(key, _)| *key == name).unwrap();
+    let (committed, rx_committed) = channel(10);
+    let (_transactions, rx_transactions) = channel(10);
+    let (tx_core, mut proposals) = channel(10);
+    let (epoch, rx_epoch) = tokio::sync::watch::channel(0);
+    let (view, rx_view) = tokio::sync::watch::channel((0, 0));
+    Proposer::spawn(
+        name,
+        0,
+        8,
+        4,
+        rx_epoch,
+        SignatureService::new(secret),
+        32,
+        10,
+        rx_committed,
+        rx_transactions,
+        tx_core,
+        Some(rx_view),
+    );
+    let first = timeout(Duration::from_secs(1), proposals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    view.send((0, 1)).unwrap();
+    committed.send(first.position).await.unwrap();
+    assert!(timeout(Duration::from_millis(50), proposals.recv())
+        .await
+        .is_err());
+    epoch.send(1).unwrap();
+    let next = timeout(Duration::from_secs(1), proposals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.position, Position::for_epoch(1, 0, 1));
 }

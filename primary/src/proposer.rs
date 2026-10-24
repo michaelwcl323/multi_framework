@@ -31,6 +31,7 @@ pub(crate) struct Proposer {
     sequence: Sequence,
     in_flight: bool,
     transactions: Vec<Transaction>,
+    rx_view: Option<watch::Receiver<(u64, u64)>>,
     payload_size: usize,
 }
 
@@ -48,6 +49,7 @@ impl Proposer {
         rx_committed: Receiver<Position>,
         rx_transactions: Receiver<Transaction>,
         tx_core: Sender<PrePrepare>,
+        rx_view: Option<watch::Receiver<(u64, u64)>>,
     ) {
         tokio::spawn(async move {
             let epoch = Epoch::new(*rx_epoch.borrow(), epoch_length, segments)
@@ -68,6 +70,7 @@ impl Proposer {
                 sequence: 1,
                 in_flight: false,
                 transactions: Vec::new(),
+                rx_view,
                 payload_size: 0,
             }
             .run()
@@ -136,7 +139,12 @@ impl Proposer {
                     .as_mut()
                     .reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
             }
-            if self.sequence <= self.segment.slots
+            let stopped = self.rx_view.as_ref().map_or(false, |rx| {
+                let (epoch, view) = *rx.borrow();
+                epoch == self.segment.epoch && view > 0
+            });
+            if !stopped
+                && self.sequence <= self.segment.slots
                 && !self.in_flight
                 && (timer.is_elapsed() || self.payload_size >= self.batch_size)
             {
@@ -145,6 +153,7 @@ impl Proposer {
                     .as_mut()
                     .reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
             }
+            let rx_view = &mut self.rx_view;
             tokio::select! {
                 Some(position) = self.rx_committed.recv() => {
                     if self.in_flight && position == Position::for_epoch(self.segment.epoch, self.instance, self.sequence) {
@@ -158,6 +167,14 @@ impl Proposer {
                 }
                 changed = self.rx_epoch.changed() => {
                     if changed.is_err() { return; }
+                },
+                changed = async move {
+                    match rx_view.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() { self.rx_view = None; }
                 },
                 _ = &mut timer, if !timer.is_elapsed() => {},
                 else => break,

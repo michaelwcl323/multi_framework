@@ -42,10 +42,11 @@ fn invalid_layouts_positions_and_overflow_are_rejected() {
     assert!(epoch.position(22).is_none());
     assert!(epoch.global_sn(Position::for_epoch(1, 0, 1)).is_none());
     assert!(epoch.global_sn(Position::for_epoch(2, 3, 2)).is_none());
-    assert!(epoch
-        .global_sn(Position {
+    assert_eq!(
+        epoch.global_sn(Position {
             view: 1,
             ..Position::for_epoch(2, 0, 1)
-        })
-        .is_none());
+        }),
+        Some(15)
+    );
 }

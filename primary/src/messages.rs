@@ -28,7 +28,26 @@ pub fn leader(committee: &Committee, instance: Instance) -> Option<PublicKey> {
     committee.authorities.keys().nth(instance as usize).copied()
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The SB sender is fixed; only the segment's PBFT primary rotates with its view.
+pub fn primary(committee: &Committee, instance: Instance, view: u64) -> Option<PublicKey> {
+    if instance >= committee.size() as u64 {
+        return None;
+    }
+    leader(
+        committee,
+        ((instance as u128 + view as u128) % committee.size() as u128) as u64,
+    )
+}
+
+/// Logical log identity, independent of the view that supplies its certificate.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SlotKey {
+    pub epoch: u64,
+    pub instance: Instance,
+    pub sequence: Sequence,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Position {
     pub epoch: u64,
     pub instance: Instance,
@@ -55,11 +74,16 @@ impl Position {
     }
 
     pub fn verify(&self) -> PbftResult<()> {
-        ensure!(
-            self.view == 0 && self.sequence > 0,
-            PbftError::UnsupportedPosition(*self)
-        );
+        ensure!(self.sequence > 0, PbftError::UnsupportedPosition(*self));
         Ok(())
+    }
+
+    pub fn slot(&self) -> SlotKey {
+        SlotKey {
+            epoch: self.epoch,
+            instance: self.instance,
+            sequence: self.sequence,
+        }
     }
 
     /// Checked finite-epoch mapping, shared with the canonical ISS epoch layout.
@@ -82,7 +106,8 @@ impl Position {
 
     fn verify_instance(&self, committee: &Committee) -> PbftResult<PublicKey> {
         self.verify()?;
-        leader(committee, self.instance).ok_or(PbftError::UnknownInstance(self.instance))
+        primary(committee, self.instance, self.view)
+            .ok_or(PbftError::UnknownInstance(self.instance))
     }
 
     fn hash_into(&self, hasher: &mut Sha512) {
@@ -129,6 +154,9 @@ pub struct PrePrepare {
     pub batch: Batch,
     pub author: PublicKey,
     pub signature: Signature,
+    /// Original SB sender's view-zero signature. Recovery never authorizes a
+    /// new client batch, even when the original sender becomes primary again.
+    pub origin: Option<Signature>,
 }
 
 impl PrePrepare {
@@ -143,9 +171,49 @@ impl PrePrepare {
             batch,
             author,
             signature: Signature::default(),
+            origin: None,
         };
         proposal.signature = signatures.request_signature(proposal.digest()).await;
         proposal
+    }
+
+    pub async fn recover(
+        previous: &PrePrepare,
+        view: u64,
+        author: PublicKey,
+        signatures: &mut SignatureService,
+    ) -> Self {
+        let mut proposal = Self {
+            position: Position {
+                view,
+                ..previous.position
+            },
+            batch: previous.batch.clone(),
+            author,
+            signature: Signature::default(),
+            origin: Some(
+                previous
+                    .origin
+                    .as_ref()
+                    .unwrap_or(&previous.signature)
+                    .clone(),
+            ),
+        };
+        proposal.signature = signatures.request_signature(proposal.digest()).await;
+        proposal
+    }
+
+    pub fn original_digest(&self, committee: &Committee) -> PbftResult<Digest> {
+        let sender = leader(committee, self.position.instance)
+            .ok_or(PbftError::UnknownInstance(self.position.instance))?;
+        Ok(proposal_digest(
+            Position {
+                view: 0,
+                ..self.position
+            },
+            sender,
+            &self.batch.id,
+        ))
     }
 
     pub fn verify(&self, committee: &Committee) -> PbftResult<()> {
@@ -163,19 +231,38 @@ impl PrePrepare {
             PbftError::InvalidBatchId
         );
         self.signature.verify(&self.digest(), &self.author)?;
+        if self.position.view == 0 {
+            ensure!(self.origin.is_none(), PbftError::InvalidRecovery);
+        } else {
+            let sender = leader(committee, self.position.instance).unwrap();
+            let origin = self.origin.as_ref().ok_or(PbftError::InvalidRecovery)?;
+            let digest = proposal_digest(
+                Position {
+                    view: 0,
+                    ..self.position
+                },
+                sender,
+                &self.batch.id,
+            );
+            origin.verify(&digest, &sender)?;
+        }
         Ok(())
     }
 }
 
 impl Hash for PrePrepare {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(b"iss/pbft/preprepare/v1");
-        self.position.hash_into(&mut hasher);
-        hasher.update(self.author);
-        hasher.update(&self.batch.id);
-        Digest(hasher.finalize()[..32].try_into().unwrap())
+        proposal_digest(self.position, self.author, &self.batch.id)
     }
+}
+
+fn proposal_digest(position: Position, author: PublicKey, batch: &Digest) -> Digest {
+    let mut hasher = Sha512::new();
+    hasher.update(b"iss/pbft/preprepare/v1");
+    position.hash_into(&mut hasher);
+    hasher.update(author);
+    hasher.update(batch);
+    Digest(hasher.finalize()[..32].try_into().unwrap())
 }
 
 impl fmt::Display for PrePrepare {
@@ -243,6 +330,8 @@ pub enum PbftMessage {
     PrePrepare(PrePrepare),
     Prepare(Prepare),
     Commit(Commit),
+    ViewChange(crate::ViewChange),
+    NewView(crate::NewView),
 }
 
 impl PbftMessage {
@@ -251,6 +340,8 @@ impl PbftMessage {
             Self::PrePrepare(x) => x.position,
             Self::Prepare(x) => x.position,
             Self::Commit(x) => x.position,
+            Self::ViewChange(x) => x.position(),
+            Self::NewView(x) => x.position(),
         }
     }
 
@@ -259,6 +350,18 @@ impl PbftMessage {
             Self::PrePrepare(x) => x.verify(committee),
             Self::Prepare(x) => x.verify(committee),
             Self::Commit(x) => x.verify(committee),
+            Self::ViewChange(x) => x.verify(committee),
+            Self::NewView(x) => x.verify(committee),
+        }
+    }
+
+    pub(crate) fn phase_author(&self) -> (u8, PublicKey) {
+        match self {
+            Self::PrePrepare(x) => (0, x.author),
+            Self::Prepare(x) => (1, x.author),
+            Self::Commit(x) => (2, x.author),
+            Self::ViewChange(x) => (3, x.author),
+            Self::NewView(x) => (4, x.author),
         }
     }
 }

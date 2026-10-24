@@ -26,6 +26,15 @@ class LogParser:
         assert all(isinstance(x, str) for y in inputs for x in y)
         assert all(x for x in inputs)
 
+        # A recovered proposal has a new signed digest but retains the original
+        # batch's start time, payload size and client samples.
+        self.batch_origins = {}
+        for log in primaries:
+            for recovered, original in findall(
+                    r'Recovered B\d+\([^ ]+\) -> (\S+) origin_proposal=(\S+)', log):
+                if self.batch_origins.setdefault(recovered, original) != original:
+                    raise ParseError('Conflicting recovered proposal origin')
+
         self.faults = faults
         if isinstance(faults, int):
             self.committee_size = len(primaries) + int(faults)
@@ -51,8 +60,10 @@ class LogParser:
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
         proposals, commits, self.configs, primary_ips = zip(*results)
-        self.proposals = self._merge_results([x.items() for x in proposals])
-        self.commits = self._merge_results([x.items() for x in commits])
+        self.proposals = self._merge_results([
+            [(self.batch_origins.get(d, d), t) for d, t in x.items()] for x in proposals])
+        self.commits = self._merge_results([
+            [(self.batch_origins.get(d, d), t) for d, t in x.items()] for x in commits])
 
         # Parse the workers logs.
         try:
@@ -143,10 +154,10 @@ class LogParser:
             raise ParseError('Worker(s) panicked')
 
         tmp = findall(r'Batch ([^ ]+) contains (\d+) B', log)
-        sizes = {d: int(s) for d, s in tmp}
+        sizes = {self.batch_origins.get(d, d): int(s) for d, s in tmp}
 
         tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
-        samples = {int(s): d for d, s in tmp}
+        samples = {int(s): self.batch_origins.get(d, d) for d, s in tmp}
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 

@@ -15,6 +15,8 @@ type Value = Vec<u8>;
 
 pub enum StoreCommand {
     Write(Key, Value),
+    WriteChecked(Key, Value, oneshot::Sender<StoreResult<()>>),
+    DeleteChecked(Vec<Key>, oneshot::Sender<StoreResult<()>>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
 }
@@ -43,6 +45,24 @@ impl Store {
                     StoreCommand::Read(key, sender) => {
                         let response = db.get(&key);
                         let _ = sender.send(response);
+                    }
+                    StoreCommand::WriteChecked(key, value, sender) => {
+                        let response = db.put(&key, &value);
+                        if response.is_ok() {
+                            if let Some(mut senders) = obligations.remove(&key) {
+                                while let Some(s) = senders.pop_front() {
+                                    let _ = s.send(Ok(value.clone()));
+                                }
+                            }
+                        }
+                        let _ = sender.send(response);
+                    }
+                    StoreCommand::DeleteChecked(keys, sender) => {
+                        let mut batch = rocksdb::WriteBatch::default();
+                        for key in keys {
+                            batch.delete(key);
+                        }
+                        let _ = sender.send(db.write(batch));
                     }
                     StoreCommand::NotifyRead(key, sender) => {
                         let response = db.get(&key);
@@ -76,6 +96,30 @@ impl Store {
         receiver
             .await
             .expect("Failed to receive reply to Read command from store")
+    }
+
+    /// Acknowledge the database put result without reading or cloning its value.
+    /// This uses the database's existing WAL/write options; it adds no fsync.
+    pub async fn write_checked(&mut self, key: Key, value: Value) -> StoreResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.channel
+            .send(StoreCommand::WriteChecked(key, value, sender))
+            .await
+            .expect("Failed to send checked Write command to store");
+        receiver
+            .await
+            .expect("Failed to receive checked Write result")
+    }
+
+    pub async fn delete_checked(&mut self, keys: Vec<Key>) -> StoreResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.channel
+            .send(StoreCommand::DeleteChecked(keys, sender))
+            .await
+            .expect("Failed to send checked Delete command to store");
+        receiver
+            .await
+            .expect("Failed to receive checked Delete result")
     }
 
     pub async fn notify_read(&mut self, key: Key) -> StoreResult<Value> {

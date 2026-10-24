@@ -46,6 +46,30 @@ async fn read_unknown_key() {
 }
 
 #[tokio::test]
+async fn checked_write_acknowledges_the_put_and_satisfies_waiters() {
+    let path = ".db_test_checked_write";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+    let mut reader = store.clone();
+    let waiting = tokio::spawn(async move { reader.notify_read(vec![1]).await.unwrap() });
+    store.write_checked(vec![1], vec![2; 1024]).await.unwrap();
+    assert_eq!(store.read(vec![1]).await.unwrap(), Some(vec![2; 1024]));
+    assert_eq!(waiting.await.unwrap(), vec![2; 1024]);
+}
+
+#[tokio::test]
+async fn checked_delete_removes_only_the_selected_records() {
+    let path = ".db_test_checked_delete";
+    let _ = fs::remove_dir_all(path);
+    let mut store = Store::new(path).unwrap();
+    store.write_checked(vec![1], vec![11]).await.unwrap();
+    store.write_checked(vec![2], vec![22]).await.unwrap();
+    store.delete_checked(vec![vec![1], vec![3]]).await.unwrap();
+    assert!(store.read(vec![1]).await.unwrap().is_none());
+    assert_eq!(store.read(vec![2]).await.unwrap(), Some(vec![22]));
+}
+
+#[tokio::test]
 async fn read_notify() {
     // Create new store.
     let path = ".db_test_read_notify";

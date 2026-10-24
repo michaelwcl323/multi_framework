@@ -88,6 +88,7 @@ pub fn proposal_at(position: Position, transactions: Vec<Vec<u8>>) -> PrePrepare
         batch: Batch::new(transactions),
         author,
         signature: Signature::default(),
+        origin: None,
     };
     proposal.signature = Signature::new(&proposal.digest(), &secret);
     proposal

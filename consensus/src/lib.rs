@@ -26,6 +26,7 @@ struct GlobalOrder {
     epoch: Epoch,
     delivered: GlobalSequence,
     pending: BTreeMap<GlobalSequence, CommittedBatch>,
+    committed: BTreeMap<GlobalSequence, crypto::Digest>,
 }
 
 impl GlobalOrder {
@@ -34,6 +35,7 @@ impl GlobalOrder {
             delivered: epoch.first_sn() - 1,
             epoch,
             pending: BTreeMap::new(),
+            committed: BTreeMap::new(),
         }
     }
 
@@ -47,17 +49,16 @@ impl GlobalOrder {
             });
         }
         let global = position.global_sequence(committee.size() as u64, self.epoch.length())?;
-        if global <= self.delivered {
-            return Ok(());
-        }
-        if let Some(previous) = self.pending.get(&global) {
-            if previous.proposal.digest() != decision.proposal.digest() {
+        if let Some(previous) = self.committed.get(&global) {
+            if *previous != decision.proposal.batch.id {
                 return Err(PbftError::ConflictingGlobalDecision(global));
             }
             return Ok(());
         }
         // Retain verified current-epoch decisions even beyond the PBFT receive
         // window. Finite segment quotas bound the normal epoch's backlog.
+        self.committed
+            .insert(global, decision.proposal.batch.id.clone());
         self.pending.insert(global, decision);
         Ok(())
     }
@@ -75,6 +76,7 @@ impl GlobalOrder {
     fn advance_epoch(&mut self) {
         assert_eq!(self.delivered, self.epoch.last_sn());
         assert!(self.pending.is_empty());
+        self.committed.clear();
         self.epoch = self.epoch.next().expect("Global sequence space exhausted");
     }
 }

@@ -160,6 +160,27 @@ class IntegratedBenchTests(unittest.TestCase):
             self.assertEqual(len(parser.commits), 2)
             self.assertIn('1 (MultiBFT)', parser.result())
 
+    def test_recovered_batch_keeps_original_proposal_time_and_client_samples(self):
+        def line(at, body):
+            return f'[2026-10-21T00:00:{at}Z INFO test] {body}\n'
+        client = ''.join(line(at, body) for at, body in [
+            ('00.000','Transactions size: 512 B'), ('00.000','Transactions rate: 1000 tx/s'),
+            ('00.000','Start sending transactions'), ('00.100','Sending sample transaction 42')])
+        primary = ''.join(line('00.000', body) for body in [
+            'Garbage collection depth set to 50 rounds', 'Sync retry delay set to 1000 ms',
+            'Sync retry nodes set to 3 nodes', 'Batch size set to 500000 B',
+            'Max batch delay set to 200 ms', 'Primary key successfully booted on 127.0.0.1',
+            'MultiBFT enabled: 4 instances; local instance 0; epoch 0, view 0'])
+        primary += ''.join(line(at, body) for at, body in [
+            ('00.200','Batch old= contains 512 B'), ('00.200','Batch old= contains sample tx 42'),
+            ('00.200','Created B1(old-primary) -> old='),
+            ('00.400','Recovered B1(new-primary) -> new= origin_proposal=old= epoch=0 global_sn=1'),
+            ('00.600','Committed B1(new-primary) -> new= (instance 0) epoch=0 global_sn=1')])
+        parser = LogParser([client], [primary], [])
+        self.assertEqual(parser.sizes, {'old=': 512})
+        self.assertAlmostEqual(parser._consensus_latency(), .4, places=5)
+        self.assertAlmostEqual(parser._end_to_end_latency(), .5, places=5)
+
 
 if __name__ == '__main__':
     unittest.main()

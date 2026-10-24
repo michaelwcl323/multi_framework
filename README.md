@@ -1,4 +1,4 @@
-# ISS: finite segments and epochs
+# ISS: finite segments, epochs and view change state
 
 Each authority runs one node process and leads one PBFT segment per epoch.
 Segment IDs are zero-based positions in sorted committee public-key order.
@@ -63,6 +63,31 @@ quorum weight. Authenticated messages for the immediately following epoch are
 buffered without voting and replayed after the local barrier; the buffer is
 bounded by slot/phase/sender and the existing receive window. Older messages and
 old proposer feedback cannot advance current-epoch state.
+
+## Step 6: view change state
+
+Signed `ViewChange` reports carry Prepared Evidence: the original proposal and a
+unique, stake-weighted Prepare quorum, optionally with a complete Commit quorum.
+A segment's new primary rotates with the view. A quorum of reports authorizes a
+signed `NewView`, which must recover the highest prepared view for each evidenced
+slot. Recovery retains the original sender's signature and the same batch and
+global SN. Old-view votes stop counting after a replica leaves that view, and
+committed values survive local slot cleanup and cannot be replaced or delivered
+twice. These messages and certificates are exposed by the `primary` crate.
+
+Prepared payloads and votes are stored in RocksDB before broadcasting Commit;
+the in-memory history keeps only position/digest references. ViewChange loads and
+validates the indexed evidence. This adds a normal-path Prepared write; it is not
+a claim of zero performance overhead. Records retire at the local epoch barrier.
+Large recovery messages use authenticated fragments on the existing PBFT
+transport. Client transactions continue to feed their local proposer directly.
+
+This step supplies recovery state and authenticated message handling. Automatic
+timeouts, failure detection, bottom/no-op recovery for slots without evidence,
+request resurrection, checkpoints and restart state reconstruction are not
+implemented. Evidence-free holes remain undecided and can still block an epoch.
+See [view change state](docs/view-change-state.md) for the protocol boundaries,
+storage behavior and validation.
 
 ## Configuration and running
 
