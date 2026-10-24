@@ -1,5 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from os.path import join
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 class BenchError(Exception):
@@ -44,6 +46,19 @@ class PathMaker:
         return 'logs'
 
     @staticmethod
+    def reset_logs_path():
+        """Start a clean download while retaining the previous logs."""
+        logs = Path(PathMaker.logs_path())
+        if logs.exists() and any(logs.iterdir()):
+            archive = Path(PathMaker.results_path()) / (
+                'logs-before-refresh-' + datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+            )
+            archive.mkdir(parents=True)
+            logs.rename(archive / 'logs')
+        logs.mkdir(parents=True, exist_ok=True)
+        return str(logs)
+
+    @staticmethod
     def primary_log_file(i):
         assert isinstance(i, int) and i >= 0
         return join(PathMaker.logs_path(), f'primary-{i}.log')
@@ -63,6 +78,10 @@ class PathMaker:
     @staticmethod
     def results_path():
         return 'results'
+
+    @staticmethod
+    def summary_file():
+        return join(PathMaker.results_path(), 'summary.txt')
 
     @staticmethod
     def result_file(faults, nodes, workers, collocate, rate, tx_size):

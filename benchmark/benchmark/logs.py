@@ -64,6 +64,13 @@ class LogParser:
             [(self.batch_origins.get(d, d), t) for d, t in x.items()] for x in proposals])
         self.commits = self._merge_results([
             [(self.batch_origins.get(d, d), t) for d, t in x.items()] for x in commits])
+        missing = self.commits.keys() - self.proposals.keys()
+        if missing:
+            example = sorted(missing)[0]
+            raise ParseError(
+                f'{len(missing)} committed batch(es) have no original proposal timestamp '
+                f'(for example {example}). Check for missing nodes or mixed benchmark runs.'
+            )
 
         # Parse the workers logs.
         try:
@@ -277,23 +284,40 @@ class LogParser:
 
     def print(self, filename):
         assert isinstance(filename, str)
+        result = self.result()
         with open(filename, 'a') as f:
-            f.write(self.result())
+            f.write(result)
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, faults=0, node_indices=None):
         assert isinstance(directory, str)
 
+        if node_indices is not None:
+            indices = sorted(set(node_indices))
+            expected = {join(directory, f'primary-{i}.log') for i in indices}
+            actual = set(glob(join(directory, 'primary-*.log')))
+            if expected - actual:
+                raise ParseError(f'Missing primary logs for this run: {sorted(expected - actual)}')
+            if actual - expected:
+                Print.warn(f'Ignoring primary logs outside this run\'s active nodes: {sorted(actual - expected)}')
+            primary_files = sorted(expected)
+            client_files = sorted(f for i in indices for f in glob(join(directory, f'client-{i}-*.log')))
+            worker_files = sorted(f for i in indices for f in glob(join(directory, f'worker-{i}-*.log')))
+        else:
+            primary_files = sorted(glob(join(directory, 'primary-*.log')))
+            client_files = sorted(glob(join(directory, 'client-*.log')))
+            worker_files = sorted(glob(join(directory, 'worker-*.log')))
+
         clients = []
-        for filename in sorted(glob(join(directory, 'client-*.log'))):
+        for filename in client_files:
             with open(filename, 'r') as f:
                 clients += [f.read()]
         primaries = []
-        for filename in sorted(glob(join(directory, 'primary-*.log'))):
+        for filename in primary_files:
             with open(filename, 'r') as f:
                 primaries += [f.read()]
         workers = []
-        for filename in sorted(glob(join(directory, 'worker-*.log'))):
+        for filename in worker_files:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 

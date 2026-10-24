@@ -1107,6 +1107,7 @@ class CloudLabBench:
     def _logs(self, committee, faults, max_workers=1):
         """Download logs from all hosts using download_logs.py"""
         Print.info('Downloading logs...')
+        node_indices = list(range(committee.size() - faults))
         
         # Get benchmark directory (parent of benchmark/benchmark/)
         benchmark_dir = Path(__file__).parent.parent
@@ -1117,14 +1118,15 @@ class CloudLabBench:
             Print.error('Falling back to basic log download...')
             # Fallback: create logs directory and return parser
             Path(PathMaker.logs_path()).mkdir(parents=True, exist_ok=True)
-            return LogParser.process(PathMaker.logs_path(), faults=faults)
+            return LogParser.process(PathMaker.logs_path(), faults=faults, node_indices=node_indices)
         
         # Run download_logs.py to download all logs
         try:
             import sys
             Print.info(f'Running download_logs.py with max_workers={max_workers}...')
             result = subprocess.run(
-                [sys.executable, str(download_logs_script), '--max-workers', str(max_workers)],
+                [sys.executable, str(download_logs_script), '--max-workers', str(max_workers),
+                 '--refresh', '--nodes', ','.join(map(str, node_indices))],
                 cwd=str(benchmark_dir),
                 capture_output=False,  # Show output in real-time
                 text=True
@@ -1133,10 +1135,9 @@ class CloudLabBench:
             if result.returncode == 0:
                 Print.info('✓ download_logs.py completed successfully')
             else:
-                Print.warn(f'⚠ download_logs.py exited with code {result.returncode}')
+                raise RuntimeError(f'download_logs.py exited with code {result.returncode}')
         except Exception as e:
-            Print.warn(f'⚠ Failed to run download_logs.py: {e}')
-            Print.warn('Logs may be incomplete')
+            raise BenchError('Failed to download the current run logs', e)
         
         # After downloading logs, run processing script
         Print.info('=' * 60)
@@ -1149,7 +1150,8 @@ class CloudLabBench:
             if run_benchmark_script.exists():
                 Print.info('Running run_cloudlab_benchmark.py --no-run to process logs...')
                 result = subprocess.run(
-                    [sys.executable, str(run_benchmark_script), '--no-run'],
+                    [sys.executable, str(run_benchmark_script), '--no-run', '--faults', str(faults),
+                     '--nodes', str(committee.size())],
                     cwd=str(benchmark_dir),
                     capture_output=False,  # Show output in real-time
                     text=True
@@ -1166,7 +1168,7 @@ class CloudLabBench:
         Print.info('=' * 60)
         
         # Parse and return logs
-        return LogParser.process(PathMaker.logs_path(), faults=faults)
+        return LogParser.process(PathMaker.logs_path(), faults=faults, node_indices=node_indices)
     
     def _background_run(self, host_info, command, log_file):
         """Run a command in the background using nohup on a remote host"""

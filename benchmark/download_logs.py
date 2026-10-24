@@ -331,7 +331,7 @@ def collect_primary_logs_via_node0(conn, repo_name, host_info, node_indices=None
     
     return collected_logs, temp_dir
 
-def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh=False):
+def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh=False, node_indices=None):
     """Download logs from all CloudLab hosts directly from local machine"""
     
     # Load settings
@@ -350,7 +350,14 @@ def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh
         Print.error('No hosts configured')
         return False
     
-    Print.info(f'Downloading logs directly from {len(host_info)} nodes')
+    if node_indices is None:
+        node_indices = list(range(len(host_info)))
+    if not node_indices or len(set(node_indices)) != len(node_indices) or any(
+            type(i) is not int or i < 0 or i >= len(host_info) for i in node_indices):
+        Print.warn('Invalid or empty node indices for log download')
+        return False
+
+    Print.info(f'Downloading logs directly from {len(node_indices)} nodes')
     Print.info(f'Repository name: {repo_name}')
     Print.info('=' * 60)
     sys.stdout.flush()
@@ -368,16 +375,18 @@ def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh
         logs_dir.mkdir(parents=True, exist_ok=True)
     
     # Download logs directly from each node
+    failed = []
     try:
         Print.info('Downloading logs directly from all nodes...')
         sys.stdout.flush()
         
-        for i, host in enumerate(host_info):
+        for position, i in enumerate(node_indices):
+            host = host_info[i]
             hostname = host['hostname']
             username = host.get('username', 'root')
             port = host.get('port', 22)
             
-            Print.info(f'  [{i+1}/{len(host_info)}] Downloading from node{i} ({hostname})...')
+            Print.info(f'  [{position+1}/{len(node_indices)}] Downloading from node{i} ({hostname})...')
             sys.stdout.flush()
             
             # Helper function to download a single file with fresh connection
@@ -417,6 +426,7 @@ def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh
                     Print.info(f'    ✓ Downloaded primary-{i}.log')
                 else:
                     Print.warn(f'    ⚠ primary-{i}.log not found or failed to download')
+                    failed.append(f'primary-{i}.log')
                 
                 # Download client logs
                 for j in range(max_workers):
@@ -424,12 +434,17 @@ def download_logs(settings_file='cloudlab_settings.json', max_workers=1, refresh
                     log_filename = f'client-{i}-{j}.log'
                     local_log_path = logs_dir / log_filename
                     
-                    download_file_with_fresh_conn(remote_log, local_log_path, f'client-{i}-{j}.log')
+                    if not download_file_with_fresh_conn(remote_log, local_log_path, f'client-{i}-{j}.log'):
+                        failed.append(log_filename)
                 
             except Exception as e:
                 Print.warn(f'  ⚠ Failed to connect to node{i} ({hostname}): {e}')
+                failed.append(f'node{i}')
                 continue
-        
+
+        if failed:
+            Print.warn(f'Incomplete log download: {", ".join(failed)}')
+            return False
         Print.info('✓ Log download completed')
         return True
         
@@ -583,16 +598,16 @@ if __name__ == '__main__':
                        help='Clear the shared local logs directory before downloading')
     
     args = parser.parse_args()
-    
+    node_indices = None
+    if args.nodes:
+        try:
+            node_indices = [int(x.strip()) for x in args.nodes.split(',')]
+        except ValueError:
+            parser.error(f'Invalid node indices: {args.nodes}')
+
     if args.primary_only:
-        node_indices = None
-        if args.nodes:
-            try:
-                node_indices = [int(x.strip()) for x in args.nodes.split(',')]
-            except ValueError:
-                Print.error(f'Invalid node indices: {args.nodes}')
-                sys.exit(1)
         success = download_primary_logs(args.settings, node_indices, refresh=args.refresh)
     else:
-        success = download_logs(args.settings, args.max_workers, refresh=args.refresh)
+        success = download_logs(args.settings, args.max_workers, refresh=args.refresh,
+                                node_indices=node_indices)
     sys.exit(0 if success else 1)
